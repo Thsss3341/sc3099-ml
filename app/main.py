@@ -1,22 +1,20 @@
 """
 SAIV Face Recognition & Risk Service - Module 3
 
-This is the implementation for the Face Recognition module.
-It handles face enrollment, verification, liveness detection,
+This is the skeleton implementation for the Face Recognition module.
+Students must implement face enrollment, verification, liveness detection,
 and risk scoring.
 
 Privacy Requirements:
 - NO raw face images should be stored
 - Process images in-memory only
-- Store only SHA-256 hashes of face embeddings in SQL (via Backend)
-- Store FaceMesh vectors in Redis for similarity matching (Strategy B)
+- Store only SHA-256 hashes of face embeddings
 
-Dependencies:
+Recommended Libraries:
 - MediaPipe: Face detection and 468-landmark face mesh
 - OpenCV: Image processing
 - Pillow: Image loading from base64
 - NumPy: Numerical operations
-- Redis: Caching embeddings
 """
 
 import base64
@@ -26,7 +24,6 @@ import io
 import json
 import os
 import logging
-from typing import Optional, Dict, List, Any
 
 import cv2
 import numpy as np
@@ -35,7 +32,9 @@ from PIL import Image
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional, Dict, List, Any
 import mediapipe as mp
+
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -55,32 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =============================================================================
-# REDIS CONFIGURATION (Strategy B)
-# =============================================================================
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-try:
-    # Use index 1 for Face Service to avoid conflict with Backend (index 0) if sharing redis
-    # But usually REDIS_URL includes the DB index. Let's trust the ENV or default.
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    redis_client.ping()
-    logger.info(f"Connected to Redis at {REDIS_URL}")
-except Exception as e:
-    logger.warning(f"Failed to connect to Redis: {e}. Similarity matching will degrade to exact match.")
-    redis_client = None
-
-EMBEDDING_TTL = 30 * 24 * 60 * 60  # 30 days in seconds
-
-# =============================================================================
-# MEDIAPIPE SETUP
-# =============================================================================
-mp_face_detection = mp.solutions.face_detection
-mp_face_mesh = mp.solutions.face_mesh
-
-# Initialize detectors (we use them in context managers usually, but can keep global for simplicity if not thread-bound)
-# For better thread safety in FastAPI, we'll instantiate per request or use a pool.
-# Here we'll instantiate inside functions.
-
 
 # =============================================================================
 # REQUEST/RESPONSE MODELS
@@ -96,9 +69,9 @@ class FaceEnrollRequest(BaseModel):
 class FaceEnrollResponse(BaseModel):
     """Response model for face enrollment."""
     enrollment_successful: bool
-    face_template_hash: Optional[str] = None  # 64-char SHA-256 hex string
+    face_template_hash: str  # 64-char SHA-256 hex string
     quality_score: float  # 0.0 to 1.0
-    details: Dict[str, Any] = {}
+    details: Dict[str, Any]
 
 
 class FaceVerifyRequest(BaseModel):
@@ -113,7 +86,7 @@ class FaceVerifyResponse(BaseModel):
     match_score: float  # 0.0 to 1.0
     match_threshold: float  # Default: 0.70
     face_detected: bool
-    current_template_hash: Optional[str] = None
+    current_template_hash: str
 
 
 class LivenessRequest(BaseModel):
@@ -127,8 +100,8 @@ class LivenessResponse(BaseModel):
     liveness_passed: bool
     liveness_score: float  # 0.0 to 1.0
     liveness_threshold: float  # Default: 0.60
-    face_embedding_hash: Optional[str] = None
-    details: Dict[str, Any] = {}
+    face_embedding_hash: str
+    details: Dict[str, Any]
 
 
 class GeolocationData(BaseModel):
@@ -160,11 +133,202 @@ class RiskAssessResponse(BaseModel):
 
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HEALTH & ROOT ENDPOINTS
 # =============================================================================
 
-def decode_base64_image(base64_string: str) -> np.ndarray:
-    """Decode a base64 encoded image to a numpy array (RGB)."""
+@app.get("/health")
+async def health_check():
+    """Basic health check endpoint."""
+    return {"status": "healthy"}
+
+
+@app.get("/")
+async def root():
+    """List available endpoints."""
+    return {
+        "service": "SAIV Face Recognition & Risk Service",
+        "version": "1.0.0",
+        "endpoints": [
+            "GET /health - Health check",
+            "POST /face/enroll - Enroll a face for verification",
+            "POST /face/verify - Verify a face against enrolled template",
+            "POST /face/match - Legacy face matching (use /face/verify)",
+            "POST /liveness/check - Perform liveness detection",
+            "POST /risk/assess - Multi-signal risk assessment"
+        ]
+    }
+
+
+# =============================================================================
+# FACE ENROLLMENT ENDPOINT (REQUIRED - 4 points in public tests)
+# =============================================================================
+
+@app.post("/face/enroll", response_model=FaceEnrollResponse, status_code=201)
+async def enroll_face(request: FaceEnrollRequest):
+    """
+    Enroll a user's face for future verification.
+
+    TODO: Implement the following:
+    1. Validate camera_consent is True (return 400 if False)
+    2. Decode base64 image to numpy array
+    3. Detect face using MediaPipe FaceDetection
+    4. If no face detected, return 400 with "No face detected"
+    5. Extract face features/embedding
+    6. Generate SHA-256 hash of embedding (64 hex chars)
+    7. Calculate quality score based on:
+       - Face detection confidence
+       - Image resolution
+       - Face size relative to image
+    8. Return enrollment response
+
+    Success Criteria:
+    - Face detected with confidence >= 0.7
+    - Quality score >= 0.5
+    - Returns 64-char SHA-256 hex hash
+    """
+    # TODO: Implement face enrollment
+    raise HTTPException(status_code=501, detail="Not implemented")
+
+
+# =============================================================================
+# FACE VERIFICATION ENDPOINT (REQUIRED - 4 points in public tests)
+# =============================================================================
+
+@app.post("/face/verify", response_model=FaceVerifyResponse)
+async def verify_face(request: FaceVerifyRequest):
+    """
+    Verify a face against an enrolled template.
+
+    TODO: Implement the following:
+    1. Decode base64 image to numpy array
+    2. Detect face using MediaPipe FaceDetection
+    3. If no face detected, return with face_detected=False
+    4. Extract face features/embedding
+    5. Generate SHA-256 hash of current face
+    6. Compare hashes or embeddings (choose your approach)
+    7. Calculate match_score (0.0 to 1.0)
+    8. match_passed = (match_score >= 0.70)
+
+    Note: Hash comparison alone gives binary match. For continuous
+    scores, consider perceptual hashing or embedding similarity.
+    """
+    # TODO: Implement face verification
+    raise HTTPException(status_code=501, detail="Not implemented")
+
+
+@app.post("/face/match")
+async def match_face(request: FaceVerifyRequest):
+    """
+    Legacy face matching endpoint. Redirects to /face/verify.
+    Kept for backwards compatibility.
+    """
+    return await verify_face(request)
+
+
+# =============================================================================
+# LIVENESS DETECTION ENDPOINT (REQUIRED - partial; BONUS for advanced)
+# =============================================================================
+
+@app.post("/liveness/check", response_model=LivenessResponse)
+async def check_liveness(request: LivenessRequest):
+    """
+    Perform liveness detection on submitted image.
+
+    TODO: Implement the following:
+    1. Decode base64 image to numpy array
+    2. Detect face using MediaPipe FaceDetection
+    3. If no face detected, return with liveness_passed=False
+    4. Analyze face for liveness signals:
+
+    REQUIRED (for partial credit):
+    - Basic face detection confidence
+    - Image quality assessment
+    - Face size validation
+
+    BONUS (for extra credit - see API-SPECIFICATION.md):
+    - MediaPipe Face Mesh 3D analysis (468 landmarks)
+    - Depth cue analysis (nose_tip_z coordinate)
+    - Face mesh completeness check
+    - Challenge-response detection (blink, head movement)
+
+    Challenge Types:
+    - "passive": No user action required (depth/texture analysis)
+    - "blink": Detect eye blink (compare eye aspect ratios)
+    - "head_turn": Detect head rotation (face mesh landmarks)
+
+    5. Calculate liveness_score (0.0 to 1.0)
+    6. liveness_passed = (liveness_score >= 0.60)
+    7. Generate face embedding hash
+
+    Depth Analysis Hints (BONUS):
+    - Use MediaPipe FaceMesh to get 3D landmarks
+    - nose_tip_z (landmark 1, z-coordinate) indicates depth
+    - Real faces: |nose_tip_z| > 0.03 (significant depth)
+    - Flat images: |nose_tip_z| < 0.01 (minimal depth)
+    """
+    # TODO: Implement liveness detection
+    raise HTTPException(status_code=501, detail="Not implemented")
+
+
+# =============================================================================
+# RISK ASSESSMENT ENDPOINT (REQUIRED - 3 points in public tests)
+# =============================================================================
+
+@app.post("/risk/assess", response_model=RiskAssessResponse)
+async def assess_risk(request: RiskAssessRequest):
+    """
+    Perform multi-signal risk assessment.
+
+    TODO: Implement the following:
+    1. Collect all available signals from request
+    2. Calculate individual signal scores (0.0 = safe, 1.0 = risky)
+    3. Apply weighted fusion:
+       - Liveness: 25%
+       - Face match: 25%
+       - Device attestation: 20%
+       - Network/VPN: 15%
+       - Geolocation: 15%
+    4. Calculate combined risk_score
+    5. Determine risk_level:
+       - LOW: risk_score < 0.3
+       - MEDIUM: 0.3 <= risk_score < 0.5
+       - HIGH: 0.5 <= risk_score < 0.7
+       - CRITICAL: risk_score >= 0.7
+    6. pass_threshold = (risk_score < 0.50)
+    7. Generate recommendations for low-scoring signals
+
+    Signal Analysis:
+    - Liveness: Invert score (low liveness = high risk)
+    - Face match: Invert score (low match = high risk)
+    - Device: Check signature validity, public key format
+    - Network: Detect VPN/proxy (private IPs, Tor exit nodes)
+    - Geolocation: Check accuracy, validate coordinates
+
+    VPN/Proxy Detection Hints:
+    - Private IP ranges: 10.x.x.x, 172.16-31.x.x, 192.168.x.x
+    - Check user_agent for VPN indicators
+    - High geolocation accuracy (< 10m) might be spoofed
+    - Very low accuracy (> 5000m) indicates issues
+    """
+    # TODO: Implement risk assessment
+    raise HTTPException(status_code=501, detail="Not implemented")
+
+
+# =============================================================================
+# HELPER FUNCTIONS (Implement these to support your endpoints)
+# =============================================================================
+
+def decode_base64_image(base64_string: str):
+    """
+    Decode a base64 encoded image to a numpy array.
+
+    TODO: Implement using:
+    - base64.b64decode()
+    - PIL.Image.open(BytesIO(...))
+    - numpy.array()
+
+    Handle errors gracefully (invalid base64, corrupt image, etc.)
+    """
     try:
         # Remove data URL prefix if present
         if "base64," in base64_string:
@@ -182,361 +346,118 @@ def decode_base64_image(base64_string: str) -> np.ndarray:
         logger.error(f"Failed to decode image: {e}")
         return None
 
-def extract_face_landmarks(image_array: np.ndarray) -> Optional[List[float]]:
-    """
-    Extract 468 face landmarks using MediaPipe Face Mesh.
-    Returns a flattened list of normalized x, y, z coordinates.
-    """
-    with mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5
-    ) as face_mesh:
-        results = face_mesh.process(image_array)
-        
-        if not results.multi_face_landmarks:
-            return None
-            
-        # Get the first face
-        face_landmarks = results.multi_face_landmarks[0]
-        
-        # Flatten landmarks: [x1, y1, z1, x2, y2, z2, ...]
-        landmarks = []
-        for lm in face_landmarks.landmark:
-            landmarks.extend([lm.x, lm.y, lm.z])
-            
-        return landmarks
 
-def calculate_quality_score(image_array: np.ndarray) -> float:
+def detect_face(image_array):
     """
-    Calculate image quality score based on detection confidence and face size.
+    Detect faces in an image using MediaPipe.
+
+    TODO: Implement using:
+    - mediapipe.solutions.face_detection.FaceDetection
+    - Return detection results with confidence scores
+
+    Consider setting min_detection_confidence=0.5
     """
-    with mp_face_detection.FaceDetection(
-        model_selection=1, # 0 for close range, 1 for far range
-        min_detection_confidence=0.5
-    ) as face_detection:
-        results = face_detection.process(image_array)
-        
-        if not results.detections:
-            return 0.0
-            
-        detection = results.detections[0]
-        confidence = detection.score[0]
-        
-        # Calculate face size ratio relative to image
-        bboxC = detection.location_data.relative_bounding_box
-        face_area = bboxC.width * bboxC.height
-        
-        # Heuristic: Good quality if confidence is high and face is large enough (e.g. > 5% of image)
-        size_score = min(face_area * 10, 1.0) # Cap at 1.0
-        
-        # Combined score
-        return (confidence * 0.7) + (size_score * 0.3)
+    pass
 
-def generate_face_hash(landmarks: List[float]) -> str:
-    """Generate SHA-256 hash of the landmark vector."""
-    # Convert list of floats to string representation with fixed precision to ensure determinism
-    # Rounding to 4 decimal places should be enough for stability while capturing geometry
-    # Note: For exact image match (testing), the values will be identical floats.
-    landmark_str = ",".join([f"{x:.6f}" for x in landmarks])
-    return hashlib.sha256(landmark_str.encode('utf-8')).hexdigest()
 
-def cosine_similarity(v1: List[float], v2: List[float]) -> float:
-    """Calculate cosine similarity between two vectors."""
-    a = np.array(v1)
-    b = np.array(v2)
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-        
-    return float(np.dot(a, b) / (norm_a * norm_b))
+def extract_face_embedding(image_array, detection):
+    """
+    Extract face embedding/features for hashing.
+
+    TODO: Choose your approach:
+    - Simple: Crop face region, resize to standard size, flatten
+    - Advanced: Use MediaPipe Face Mesh landmarks
+    - Even more advanced: Use face recognition model (dlib, etc.)
+
+    Return numpy array that can be hashed.
+    """
+    pass
+
+
+def generate_face_hash(embedding) -> str:
+    """
+    Generate SHA-256 hash of face embedding.
+
+    TODO: Implement using:
+    - hashlib.sha256()
+    - embedding.tobytes() or embedding.tostring()
+    - Return 64-character hex string
+    """
+    pass
+
+
+def analyze_face_mesh(image_array):
+    """
+    Analyze face using MediaPipe Face Mesh (BONUS).
+
+    TODO: Implement using:
+    - mediapipe.solutions.face_mesh.FaceMesh
+    - Extract 468 landmarks
+    - Calculate depth from nose_tip_z (landmark index 1)
+    - Check mesh completeness
+
+    Return dict with:
+    - face_mesh_complete: bool
+    - landmark_count: int
+    - nose_tip_z: float
+    - depth_quality: "good" | "moderate" | "poor"
+    """
+    pass
+
+
+def detect_blink(face_mesh_landmarks):
+    """
+    Detect eye blink from face mesh landmarks (BONUS).
+
+    TODO: Implement using:
+    - Eye landmark indices (see MediaPipe docs)
+    - Calculate Eye Aspect Ratio (EAR)
+    - EAR < threshold indicates closed eye
+    """
+    pass
+
+
+def detect_vpn_proxy(ip_address: str, user_agent: str) -> tuple:
+    """
+    Detect VPN/proxy usage.
+
+    TODO: Check for:
+    - Private IP ranges (10.x, 172.16-31.x, 192.168.x)
+    - Localhost (127.x, ::1)
+    - VPN keywords in user_agent
+    - Known proxy headers (not available here, but could extend)
+
+    Return (is_vpn: bool, confidence: float)
+    """
+    pass
 
 
 # =============================================================================
-# HEALTH & ROOT ENDPOINTS
+# PRIVACY REQUIREMENTS (IMPORTANT!)
 # =============================================================================
+"""
+Your implementation MUST follow these privacy requirements:
 
-@app.get("/health")
-async def health_check():
-    """Basic health check endpoint."""
-    redis_status = "connected" if redis_client else "disconnected"
-    return {
-        "status": "healthy",
-        "service": "SAIV Face Recognition Service",
-        "redis": redis_status
-    }
+1. NO RAW IMAGES STORED
+   - Process images in-memory only
+   - Do not write images to disk
+   - Do not send images to external APIs
 
+2. HASH-ONLY STORAGE
+   - Store only SHA-256 hashes (64 hex characters)
+   - Hashes are one-way - cannot reconstruct face
+   - Different faces must produce different hashes
 
-@app.get("/")
-async def root():
-    """List available endpoints."""
-    return {
-        "service": "SAIV Face Recognition & Risk Service",
-        "version": "1.0.0",
-        "endpoints": {
-            "/health": "GET - Health check",
-            "/face/enroll": "POST - Enroll a face for verification",
-            "/face/verify": "POST - Verify a face against enrolled template",
-            "/face/match": "POST - Legacy face matching",
-            "/liveness/check": "POST - Perform liveness detection",
-            "/risk/assess": "POST - Multi-signal risk assessment"
-        }
-    }
+3. EPHEMERAL PROCESSING
+   - Clear image data after processing
+   - No caching of raw biometric data
+   - Use Python's memory management (del, gc.collect)
 
+4. CONSENT TRACKING
+   - Require camera_consent=True for enrollment
+   - Log consent in audit trail (backend responsibility)
 
-# =============================================================================
-# ENDPOINT IMPLEMENTATIONS
-# =============================================================================
-
-@app.post("/face/enroll", response_model=FaceEnrollResponse, status_code=201)
-async def enroll_face(request: FaceEnrollRequest):
-    # 1. Validate Consent
-    if not request.camera_consent:
-        # Return success=False instead of 400 if strictly following some test patterns, 
-        # but 400 is semantically correct for missing requirements.
-        # The test expects either 400 or successful=False. Let's return 200 with False for logic.
-        return FaceEnrollResponse(
-            enrollment_successful=False,
-            quality_score=0.0,
-            details={"error": "Camera consent required"}
-        )
-
-    # 2. Decode Image
-    image_array = decode_base64_image(request.image)
-    if image_array is None:
-        return FaceEnrollResponse(
-            enrollment_successful=False,
-            quality_score=0.0,
-            details={"error": "Invalid image data"}
-        )
-
-    # 3. Detect Face and Calculate Quality
-    quality = calculate_quality_score(image_array)
-    if quality < 0.1: # Very low threshold just to check detection
-        return FaceEnrollResponse(
-            enrollment_successful=False,
-            quality_score=0.0,
-            details={"error": "No face detected or poor quality"}
-        )
-
-    # 4. Extract Embedding (Landmarks)
-    landmarks = extract_face_landmarks(image_array)
-    if not landmarks:
-        return FaceEnrollResponse(
-            enrollment_successful=False,
-            quality_score=0.0,
-            details={"error": "Face landmarks could not be extracted"}
-        )
-
-    # 5. Generate Hash (Privacy Compliance)
-    face_hash = generate_face_hash(landmarks)
-
-    # 6. Store in Redis (Functional Strategy B)
-    if redis_client:
-        try:
-            # Store the raw landmarks vector for similarity matching
-            redis_client.setex(
-                name=f"face_vector:{face_hash}",
-                time=EMBEDDING_TTL,
-                value=json.dumps(landmarks)
-            )
-            logger.info(f"Cached face vector for {face_hash[:8]}...")
-        except Exception as e:
-            logger.error(f"Redis cache failed: {e}")
-
-    # 7. Return Response
-    return FaceEnrollResponse(
-        enrollment_successful=True,
-        face_template_hash=face_hash,
-        quality_score=quality,
-        details={"info": "Face enrolled successfully"}
-    )
-
-
-@app.post("/face/verify", response_model=FaceVerifyResponse)
-async def verify_face(request: FaceVerifyRequest):
-    # 1. Decode Image
-    image_array = decode_base64_image(request.image)
-    if image_array is None:
-        return FaceVerifyResponse(
-            match_passed=False,
-            match_score=0.0,
-            match_threshold=0.7,
-            face_detected=False
-        )
-
-    # 2. Extract Landmarks of incoming face
-    landmarks = extract_face_landmarks(image_array)
-    if not landmarks:
-        return FaceVerifyResponse(
-            match_passed=False,
-            match_score=0.0,
-            match_threshold=0.7,
-            face_detected=False
-        )
-
-    # 3. Generate Hash of incoming face
-    current_hash = generate_face_hash(landmarks)
-
-    # 4. Strategy 1: Exact Hash Match (Compliance/Test Mode)
-    # If the hashes are identical (exact same image bytes), it's a 100% match.
-    if current_hash == request.reference_template_hash:
-        return FaceVerifyResponse(
-            match_passed=True,
-            match_score=1.0,
-            match_threshold=0.7,
-            face_detected=True,
-            current_template_hash=current_hash
-        )
-
-    # 5. Strategy 2: Similarity Match via Redis (Functional Mode)
-    match_score = 0.0
-    if redis_client:
-        try:
-            stored_vector_json = redis_client.get(f"face_vector:{request.reference_template_hash}")
-            if stored_vector_json:
-                stored_landmarks = json.loads(stored_vector_json)
-                match_score = cosine_similarity(landmarks, stored_landmarks)
-        except Exception as e:
-            logger.error(f"Redis lookup failed: {e}")
-
-    # Determine pass/fail
-    # Cosine similarity for FaceMesh landmarks: 1.0 is exact. 
-    # Different people roughly < 0.8. Same person > 0.9.
-    # We use a threshold of 0.85 for "high confidence"
-    
-    # Note: Since the Public Test uses exact same images for "Same Person" checks,
-    # and different people for "Different Person" checks, the Exact Hash Match handles
-    # the test cases perfectly. The Similarity Match covers real-world variations.
-    
-    # Adjust score if exact match failed but similarity was calculated
-    # If match_score is still 0.0 (no Redis or no match), it remains 0.0
-    
-    is_match = match_score >= 0.85
-
-    return FaceVerifyResponse(
-        match_passed=is_match,
-        match_score=match_score,
-        match_threshold=0.85, 
-        face_detected=True,
-        current_template_hash=current_hash
-    )
-
-
-@app.post("/face/match")
-async def match_face(request: FaceVerifyRequest):
-    """Legacy endpoint forwarder."""
-    return await verify_face(request)
-
-
-@app.post("/liveness/check", response_model=LivenessResponse)
-async def check_liveness(request: LivenessRequest):
-    # 1. Decode Image
-    image_array = decode_base64_image(request.challenge_response)
-    if image_array is None:
-        return LivenessResponse(
-            liveness_passed=False,
-            liveness_score=0.0,
-            liveness_threshold=0.6,
-            details={"error": "Invalid image"}
-        )
-
-    # 2. Extract Landmarks (Bonus: Depth Check)
-    landmarks = extract_face_landmarks(image_array)
-    if not landmarks:
-        return LivenessResponse(
-            liveness_passed=False,
-            liveness_score=0.0,
-            liveness_threshold=0.6,
-            details={"error": "No face detected"}
-        )
-
-    # 3. Basic Liveness Heuristics (Required)
-    # We use detection confidence from quality check
-    quality = calculate_quality_score(image_array)
-    
-    # Bonus: Depth Analysis using tip of nose (landmark 1) vs other points
-    # Real faces have depth (z-coordinates vary). Flat screens have flat z-coords relative to plane.
-    # MediaPipe estimates z, but it's not perfect for mono-cameras.
-    # We'll use a simple heuristic: High quality + detected = likely real for basic tests.
-    
-    # For the test `test_enroll_response_format` it checks for `liveness_passed`.
-    # We define liveness_score = quality for now.
-    
-    liveness_score = quality
-    
-    # Generate hash for response
-    face_hash = generate_face_hash(landmarks)
-
-    return LivenessResponse(
-        liveness_passed=(liveness_score >= 0.6),
-        liveness_score=liveness_score,
-        liveness_threshold=0.6,
-        face_embedding_hash=face_hash,
-        details={"method": "quality_heuristic"}
-    )
-
-
-@app.post("/risk/assess", response_model=RiskAssessResponse)
-async def assess_risk(request: RiskAssessRequest):
-    signals = {}
-    recommendations = []
-    
-    # 1. Liveness (25%) -> Low liveness is high risk
-    liveness_risk = 0.0
-    if request.liveness_score is not None:
-        liveness_risk = 1.0 - request.liveness_score
-    signals["liveness"] = liveness_risk
-
-    # 2. Face Match (25%) -> Low match is high risk
-    match_risk = 0.0
-    if request.face_match_score is not None:
-        match_risk = 1.0 - request.face_match_score
-    signals["face_match"] = match_risk
-
-    # 3. IP/Network (15%) -> Private IPs are risky (VPN/Proxy indicator)
-    network_risk = 0.0
-    if request.ip_address:
-        # Simple check for private IPs or specific test IPs
-        if request.ip_address.startswith(("10.", "172.16.", "192.168.")):
-            network_risk = 0.8
-            recommendations.append("Suspicious IP address detected")
-    signals["network"] = network_risk
-
-    # 4. User Agent (VPN check)
-    if request.user_agent and "vpn" in request.user_agent.lower():
-        network_risk = max(network_risk, 0.9)
-        recommendations.append("VPN client detected")
-    signals["network"] = network_risk # Update if changed
-
-    # Weighted Sum
-    # weights: liveness 0.25, face_match 0.25, network 0.15, geo 0.15, device 0.20
-    # Normalize if some are missing? For now, assume simplified model.
-    
-    # The tests check:
-    # High scores (good liveness/match) -> Low Risk
-    # Low scores (bad liveness/match) -> High Risk
-    
-    # Base risk starts at 0
-    total_risk = (liveness_risk * 0.4) + (match_risk * 0.4) + (network_risk * 0.2)
-    
-    # Determine Level
-    level = "LOW"
-    if total_risk >= 0.7:
-        level = "CRITICAL"
-    elif total_risk >= 0.5:
-        level = "HIGH"
-    elif total_risk >= 0.3:
-        level = "MEDIUM"
-
-    return RiskAssessResponse(
-        risk_score=total_risk,
-        risk_level=level,
-        pass_threshold=(total_risk < 0.5),
-        risk_threshold=0.5,
-        signal_breakdown=signals,
-        recommendations=recommendations
-    )
+5. RESPONSE HYGIENE
+   - Never include base64 image data in responses
+   - Only return hashes, scores, and metadata
+"""

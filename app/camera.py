@@ -13,7 +13,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 os.environ["REDIS_URL"] = "redis://localhost:6380/0"
 
 try:
-    import main_test as main
+    import main
 except ImportError as e:
     print(f"Error: Could not import 'main.py'. Reason: {e}")
     sys.exit(1)
@@ -140,7 +140,10 @@ def test_camera():
                         error_msg = res.details.get('error', 'Unknown Error')
                         response_msg = f"Enrollment FAILED!\nQuality: {res.quality_score:.2f}\nReason: {error_msg}"
                 except Exception as e:
-                    response_msg = f"Error during enrollment:\n{str(e)}"
+                    if hasattr(e, "detail"):
+                        response_msg = f"Enrollment Error:\n{e.detail}"
+                    else:
+                        response_msg = f"Error during enrollment:\n{str(e)}"
             
             elif mode == "VERIFICATION":
                 if not reference_hash:
@@ -148,18 +151,19 @@ def test_camera():
                 else:
                     req = main.FaceVerifyRequest(
                         image=b64_image,
-                        user_id="test_user",
-                        reference_simhash=reference_hash
+                        reference_template_hash=reference_hash
                     )
                     try:
                         res = asyncio.run(main.verify_face(req))
-                        dist_str = f"Hamming Dist: {res.hamming_dist}/128" if res.hamming_dist is not None else ""
                         if res.match_passed:
-                            response_msg = f"Verification PASSED!\nMatch Score: {res.match_score:.2f} | {dist_str}\nUser: test_user"
+                            response_msg = f"Verification PASSED!\nMatch Score: {res.match_score:.2f}\nTemplate: {res.current_template_hash[:8]}"
                         else:
-                            response_msg = f"Verification FAILED!\nMatch Score: {res.match_score:.2f} | {dist_str}"
+                            response_msg = f"Verification FAILED!\nMatch Score: {res.match_score:.2f}\nTemplate: {res.current_template_hash[:8]}"
                     except Exception as e:
-                        response_msg = f"Error during verification:\n{str(e)}"
+                        if hasattr(e, "detail"):
+                            response_msg = f"Verification Error:\n{e.detail}"
+                        else:
+                            response_msg = f"Error during verification:\n{str(e)}"
             
             msg_timer = time.time() + 6.0
             print(response_msg.replace('\n', ' - '))

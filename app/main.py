@@ -54,6 +54,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# MediaPipe setup
+mp_face_detection = mp.solutions.face_detection
+mp_face_mesh = mp.solutions.face_mesh
+
 
 # =============================================================================
 # REQUEST/RESPONSE MODELS
@@ -186,8 +190,58 @@ async def enroll_face(request: FaceEnrollRequest):
     - Quality score >= 0.5
     - Returns 64-char SHA-256 hex hash
     """
-    # TODO: Implement face enrollment
-    raise HTTPException(status_code=501, detail="Not implemented")
+    # 1. Validate camera_consent
+    if not request.camera_consent:
+        raise HTTPException(status_code=400, detail="Camera consent is required")
+        
+    # 2. Decode base64 image to numpy array
+    image_array = decode_base64_image(request.image)
+    if image_array is None:
+        raise HTTPException(status_code=400, detail="Invalid image data")
+        
+    # 3. Detect face using MediaPipe FaceDetection
+    detection = detect_face(image_array)
+    
+    # 4. If no face detected, return 400
+    if not detection:
+        raise HTTPException(status_code=400, detail="No face detected")
+        
+    confidence = detection.score[0]
+    if confidence < 0.7:
+        raise HTTPException(status_code=400, detail=f"Face detection confidence too low ({confidence:.2f} < 0.7)")
+        
+    # 5. Extract face features/embedding
+    embedding = extract_face_embedding(image_array, detection)
+    if embedding is None:
+        raise HTTPException(status_code=400, detail="Could not extract face features")
+        
+    # 6. Generate SHA-256 hash of embedding
+    face_hash = generate_face_hash(embedding)
+    
+    # 7. Calculate quality score
+    h, w = image_array.shape[:2]
+    resolution_score = min(1.0, (h * w) / (640 * 480))
+    
+    bbox = detection.location_data.relative_bounding_box
+    face_size_ratio = bbox.width * bbox.height
+    face_size_score = min(1.0, face_size_ratio / 0.1) # Cap at 1.0 if face takes >= 10% of image
+    
+    quality_score = float(0.5 * confidence + 0.3 * face_size_score + 0.2 * resolution_score)
+    
+    if quality_score < 0.5:
+        raise HTTPException(status_code=400, detail=f"Image quality too low (score: {quality_score:.2f})")
+        
+    # 8. Return enrollment response
+    return FaceEnrollResponse(
+        enrollment_successful=True,
+        face_template_hash=face_hash,
+        quality_score=quality_score,
+        details={
+            "confidence": float(confidence),
+            "resolution": f"{w}x{h}",
+            "face_size_ratio": float(face_size_ratio)
+        }
+    )
 
 
 # =============================================================================
@@ -212,8 +266,57 @@ async def verify_face(request: FaceVerifyRequest):
     Note: Hash comparison alone gives binary match. For continuous
     scores, consider perceptual hashing or embedding similarity.
     """
-    # TODO: Implement face verification
-    raise HTTPException(status_code=501, detail="Not implemented")
+    # 1. Decode base64 image
+    image_array = decode_base64_image(request.image)
+    if image_array is None:
+        raise HTTPException(status_code=400, detail="Invalid image data")
+        
+    # 2 & 3. Detect face
+    detection = detect_face(image_array)
+    if not detection:
+        return FaceVerifyResponse(
+            match_passed=False,
+            match_score=0.0,
+            match_threshold=0.70,
+            face_detected=False,
+            current_template_hash=""
+        )
+        
+    # 4. Extract features
+    embedding = extract_face_embedding(image_array, detection)
+    if embedding is None:
+        return FaceVerifyResponse(
+            match_passed=False,
+            match_score=0.0,
+            match_threshold=0.70,
+            face_detected=True,
+            current_template_hash=""
+        )
+        
+    # 5. Generate hash of current face
+    current_hash = generate_face_hash(embedding)
+    
+    # 6 & 7. Compare hashes using Hamming Distance for SimHash
+    try:
+        dist = hamming_distance(current_hash, request.reference_template_hash)
+        match_score = max(0.0, 1.0 - (dist / 32.0))
+    except (ValueError, TypeError):
+        # Fallback if reference template is not a valid hex string (e.g. from old SHA-256 flow)
+        if current_hash == request.reference_template_hash:
+            match_score = 1.0
+        else:
+            match_score = 0.0
+
+    # 8. Determine success based on threshold
+    match_passed = match_score >= 0.70
+    
+    return FaceVerifyResponse(
+        match_passed=match_passed,
+        match_score=float(match_score),
+        match_threshold=0.70,
+        face_detected=True,
+        current_template_hash=current_hash
+    )
 
 
 @app.post("/face/match")
@@ -357,7 +460,29 @@ def detect_face(image_array):
 
     Consider setting min_detection_confidence=0.5
     """
-    pass
+    with mp_face_detection.FaceDetection(
+        model_selection=0,
+        min_detection_confidence=0.5
+    ) as face_detection:
+        results = face_detection.process(image_array)
+        
+        if not results.detections:
+            print("Detected 0 face(s)")
+            return None
+            
+        num_faces = len(results.detections)
+        print(f"Detected {num_faces} face(s)")
+        
+        if num_faces > 1:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Multiple faces detected ({num_faces}). Please ensure only one face is in the frame."
+            )
+        
+        # We only work with the first detected face
+        detection = results.detections[0]
+        
+        return detection
 
 
 def extract_face_embedding(image_array, detection):
@@ -371,19 +496,71 @@ def extract_face_embedding(image_array, detection):
 
     Return numpy array that can be hashed.
     """
-    pass
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5
+    ) as face_mesh:
+        results = face_mesh.process(image_array)
+        if not results.multi_face_landmarks:
+            return None
+        face_landmarks = results.multi_face_landmarks[0]
+        # Flatten: [x1, y1, z1, x2, y2, z2, ...]
+        # 478 landmarks × 3 coords = 1434 floats (with refine_landmarks=True)
+        embedding = []
+        for lm in face_landmarks.landmark:
+            embedding.extend([lm.x, lm.y, lm.z])
+        return np.array(embedding, dtype=np.float32)
+
+
+class SimHasher:
+    """
+    Locality-Sensitive Hashing (LSH) for 1434-dimensional FaceMesh embeddings.
+    Converts FaceMesh landmarks into a 128-bit binary hash.
+    """
+    def __init__(self, num_bits=128, input_dim=1434, seed=42):
+        self.num_bits = num_bits
+        self.input_dim = input_dim
+        # Fixed random seed ensures the same hyperplanes across server restarts
+        np.random.seed(seed)
+        self.planes = np.random.randn(self.num_bits, self.input_dim)
+        
+    def compute(self, embedding) -> str:
+        """
+        Compute the SimHash for a given FaceMesh embedding vector.
+        Returns a 32-character hex string.
+        """
+        emb_array = np.array(embedding)
+        projections = self.planes @ emb_array
+        bits = "".join("1" if p > 0 else "0" for p in projections)
+        return f"{int(bits, 2):032x}"
+
+def hamming_distance(h1: str, h2: str) -> int:
+    """
+    Compute the Hamming Distance between two SimHash hex strings.
+    """
+    # Use 256 for zipping just in case we get a 64-char sha-256
+    # But SimHash is 32 chars (128 bits). For safety handle variable length
+    try:
+        b1 = f"{int(h1, 16):0128b}"
+        b2 = f"{int(h2, 16):0128b}"
+        # If lengths don't match exactly (e.g. SHA256 vs SimHash length)
+        # Pad shorter string to avoid losing comparisons
+        max_len = max(len(b1), len(b2))
+        b1 = b1.zfill(max_len)
+        b2 = b2.zfill(max_len)
+        return sum(a != b for a, b in zip(b1, b2))
+    except ValueError:
+        return 128 # Max difference on error
 
 
 def generate_face_hash(embedding) -> str:
     """
-    Generate SHA-256 hash of face embedding.
-
-    TODO: Implement using:
-    - hashlib.sha256()
-    - embedding.tobytes() or embedding.tostring()
-    - Return 64-character hex string
+    Generate SimHash of face embedding for privacy-preserving verification.
     """
-    pass
+    hasher = SimHasher()
+    return hasher.compute(embedding)
 
 
 def analyze_face_mesh(image_array):
@@ -402,7 +579,47 @@ def analyze_face_mesh(image_array):
     - nose_tip_z: float
     - depth_quality: "good" | "moderate" | "poor"
     """
-    pass
+    with mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=False,
+        min_detection_confidence=0.5
+    ) as face_mesh:
+        results = face_mesh.process(image_array)
+        
+        if not results.multi_face_landmarks:
+            return {
+                "face_mesh_complete": False,
+                "landmark_count": 0,
+                "nose_tip_z": 0.0,
+                "depth_quality": "poor"
+            }
+            
+        face_landmarks = results.multi_face_landmarks[0]
+        landmark_count = len(face_landmarks.landmark)
+        
+        # Check completeness (MediaPipe usually returns 468 landmarks without refinement)
+        face_mesh_complete = landmark_count >= 468
+        
+        # Calculate depth from nose tip (landmark index 1)
+        nose_tip_z = face_landmarks.landmark[1].z
+        abs_z = abs(nose_tip_z)
+        
+        # |nose_tip_z| > 0.03 (significant depth)
+        # |nose_tip_z| < 0.01 (minimal depth)
+        if abs_z > 0.03:
+            depth_quality = "good"
+        elif abs_z < 0.01:
+            depth_quality = "poor"
+        else:
+            depth_quality = "moderate"
+            
+        return {
+            "face_mesh_complete": face_mesh_complete,
+            "landmark_count": landmark_count,
+            "nose_tip_z": float(nose_tip_z),
+            "depth_quality": depth_quality
+        }
 
 
 def detect_blink(face_mesh_landmarks):
@@ -414,7 +631,46 @@ def detect_blink(face_mesh_landmarks):
     - Calculate Eye Aspect Ratio (EAR)
     - EAR < threshold indicates closed eye
     """
-    pass
+    if not face_mesh_landmarks or not hasattr(face_mesh_landmarks, 'landmark'):
+        return False, 0.0
+
+    landmarks = face_mesh_landmarks.landmark
+    
+    # Left eye standard MediaPipe indices: [p1, p2, p3, p4, p5, p6]
+    LEFT_EYE = [33, 160, 158, 133, 153, 144]
+    
+    # Right eye standard MediaPipe indices: [p1, p2, p3, p4, p5, p6]
+    RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+    
+    def calculate_ear(eye_indices):
+        p1 = np.array([landmarks[eye_indices[0]].x, landmarks[eye_indices[0]].y])
+        p2 = np.array([landmarks[eye_indices[1]].x, landmarks[eye_indices[1]].y])
+        p3 = np.array([landmarks[eye_indices[2]].x, landmarks[eye_indices[2]].y])
+        p4 = np.array([landmarks[eye_indices[3]].x, landmarks[eye_indices[3]].y])
+        p5 = np.array([landmarks[eye_indices[4]].x, landmarks[eye_indices[4]].y])
+        p6 = np.array([landmarks[eye_indices[5]].x, landmarks[eye_indices[5]].y])
+        
+        vert1 = np.linalg.norm(p2 - p6)
+        vert2 = np.linalg.norm(p3 - p5)
+        horiz = np.linalg.norm(p1 - p4)
+        
+        if horiz == 0:
+            return 0.0
+            
+        return (vert1 + vert2) / (2.0 * horiz)
+        
+    left_ear = calculate_ear(LEFT_EYE)
+    right_ear = calculate_ear(RIGHT_EYE)
+    
+    # Average EAR
+    avg_ear = (left_ear + right_ear) / 2.0
+    
+    # Threshold for Blink (typically between 0.15 and 0.20)
+    BLINK_THRESHOLD = 0.18
+    
+    is_blinking = avg_ear < BLINK_THRESHOLD
+    
+    return is_blinking, avg_ear
 
 
 def detect_vpn_proxy(ip_address: str, user_agent: str) -> tuple:

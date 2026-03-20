@@ -593,13 +593,25 @@ def extract_face_embedding(image_array, detection):
         results = face_mesh.process(image_array)
         if not results.multi_face_landmarks:
             return None
+            
         face_landmarks = results.multi_face_landmarks[0]
-        # Flatten: [x1, y1, z1, x2, y2, z2, ...]
-        # 478 landmarks × 3 coords = 1434 floats (with refine_landmarks=True)
-        embedding = []
-        for lm in face_landmarks.landmark:
-            embedding.extend([lm.x, lm.y, lm.z])
-        return np.array(embedding, dtype=np.float32)
+        
+        # 1. Convert to NumPy array
+        landmarks = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks.landmark])
+        
+        # 2. Normalize Translation (Position invariant)
+        # Center ALL points relative to the tip of the nose (index 1)
+        nose_tip = landmarks[1]
+        landmarks = landmarks - nose_tip
+        
+        # 3. Normalize Scale (Distance from camera invariant)
+        # Calculate the inter-ocular distance (outer eyes: 33 and 263)
+        eye_distance = np.linalg.norm(landmarks[33] - landmarks[263])
+        if eye_distance > 0:
+            landmarks = landmarks / eye_distance
+            
+        # Return 1434 normalized floating point values
+        return landmarks.flatten().astype(np.float32)
 
 
 class SimHasher:

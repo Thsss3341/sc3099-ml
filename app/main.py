@@ -414,19 +414,45 @@ async def check_liveness(request: LivenessRequest):
             fm_res = fm.process(image_array)
             if fm_res and fm_res.multi_face_landmarks:
                 face_landmarks = fm_res.multi_face_landmarks[0]
-                
-                if request.challenge_type == "blink":
+                nose = face_landmarks.landmark[1]
+                nose_x = nose.x
+                nose_y = nose.y
+
+                if request.challenge_type in ("head_left", "head_right", "head_turn"):
+                    challenge_details["nose_x"] = nose_x
+                    if request.challenge_type == "head_left":
+                        # User turns left → nose appears on the RIGHT side of image (x > 0.58)
+                        if nose_x <= 0.58:
+                            passed_challenge = False
+                            challenge_score = 0.5
+                    elif request.challenge_type == "head_right":
+                        # User turns right → nose appears on the LEFT side of image (x < 0.42)
+                        if nose_x >= 0.42:
+                            passed_challenge = False
+                            challenge_score = 0.5
+                    else:  # generic head_turn: either direction
+                        if 0.42 <= nose_x <= 0.58:
+                            passed_challenge = False
+                            challenge_score = 0.5
+
+                elif request.challenge_type == "head_up":
+                    challenge_details["nose_y"] = nose_y
+                    # Looking up → nose moves to upper portion of frame (smaller y)
+                    if nose_y >= 0.43:
+                        passed_challenge = False
+                        challenge_score = 0.5
+
+                elif request.challenge_type == "head_down":
+                    challenge_details["nose_y"] = nose_y
+                    # Looking down → nose moves to lower portion of frame (larger y)
+                    if nose_y <= 0.57:
+                        passed_challenge = False
+                        challenge_score = 0.5
+
+                elif request.challenge_type == "blink":
                     is_blinking, avg_ear = detect_blink(face_landmarks)
                     challenge_details["ear"] = avg_ear
                     if not is_blinking:
-                        passed_challenge = False
-                        challenge_score = 0.5
-                        
-                elif request.challenge_type == "head_turn":
-                    nose_x = face_landmarks.landmark[1].x
-                    challenge_details["nose_x"] = nose_x
-                    # Head turn left or right means nose is off-center (<0.4 or >0.6)
-                    if 0.4 <= nose_x <= 0.6:
                         passed_challenge = False
                         challenge_score = 0.5
             else:
@@ -765,10 +791,13 @@ def detect_blink(face_mesh_landmarks):
     # Average EAR
     avg_ear = (left_ear + right_ear) / 2.0
     
-    # Threshold for Blink (typically between 0.15 and 0.20)
-    BLINK_THRESHOLD = 0.18
+    # Open eyes: EAR ~0.25-0.40. Closed/squinting: 0.15-0.25.
+    # Using 0.30 to catch deliberate squints without requiring full eye closure.
+    BLINK_THRESHOLD = 0.30
     
     is_blinking = avg_ear < BLINK_THRESHOLD
+    print(f"[Blink] avg_ear={avg_ear:.4f}, threshold={BLINK_THRESHOLD}, detected={is_blinking}")
+    logger.info(f"Blink check: avg_ear={avg_ear:.3f}, threshold={BLINK_THRESHOLD}, is_blinking={is_blinking}")
     
     return is_blinking, avg_ear
 

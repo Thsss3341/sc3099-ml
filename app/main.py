@@ -369,8 +369,96 @@ async def check_liveness(request: LivenessRequest):
     - Real faces: |nose_tip_z| > 0.03 (significant depth)
     - Flat images: |nose_tip_z| < 0.01 (minimal depth)
     """
-    # TODO: Implement liveness detection
-    raise HTTPException(status_code=501, detail="Not implemented")
+    # 1. Decode Image
+    image_array = decode_base64_image(request.challenge_response)
+    if image_array is None:
+        raise HTTPException(status_code=400, detail="Invalid image data")
+
+    # 2. Detect face
+    detection = detect_face(image_array)
+    if not detection:
+        return LivenessResponse(
+            liveness_passed=False,
+            liveness_score=0.0,
+            liveness_threshold=0.60,
+            face_embedding_hash="",
+            details={"error": "No face detected"}
+        )
+
+    # 3. Analyze face mesh and depth
+    mesh_results = analyze_face_mesh(image_array)
+    if not mesh_results["face_mesh_complete"]:
+        return LivenessResponse(
+            liveness_passed=False,
+            liveness_score=0.0,
+            liveness_threshold=0.60,
+            face_embedding_hash="",
+            details={"error": "Face mesh incomplete, unable to assess depth"}
+        )
+
+    confidence = detection.score[0]
+    bbox = detection.location_data.relative_bounding_box
+    face_area = bbox.width * bbox.height
+    size_score = min(1.0, face_area / 0.1) # 10% of image is max score
+
+    # Base depth score
+    depth_mod = 1.0 if mesh_results["depth_quality"] == "good" else (0.5 if mesh_results["depth_quality"] == "moderate" else 0.0)
+
+    # 4. Challenge checking
+    challenge_score = 1.0
+    passed_challenge = True
+    challenge_details = {}
+
+    if request.challenge_type != "passive":
+        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1) as fm:
+            fm_res = fm.process(image_array)
+            if fm_res and fm_res.multi_face_landmarks:
+                face_landmarks = fm_res.multi_face_landmarks[0]
+                
+                if request.challenge_type == "blink":
+                    is_blinking, avg_ear = detect_blink(face_landmarks)
+                    challenge_details["ear"] = avg_ear
+                    if not is_blinking:
+                        passed_challenge = False
+                        challenge_score = 0.5
+                        
+                elif request.challenge_type == "head_turn":
+                    nose_x = face_landmarks.landmark[1].x
+                    challenge_details["nose_x"] = nose_x
+                    # Head turn left or right means nose is off-center (<0.4 or >0.6)
+                    if 0.4 <= nose_x <= 0.6:
+                        passed_challenge = False
+                        challenge_score = 0.5
+            else:
+                passed_challenge = False
+                challenge_score = 0.0
+
+    # 5. Final calculations
+    base_liveness = (confidence * 0.4) + (size_score * 0.2) + (depth_mod * 0.4)
+    liveness_score = float(base_liveness * challenge_score)
+
+    liveness_passed = liveness_score >= 0.60 and passed_challenge
+
+    # 6. Generate embedding hash
+    embedding = extract_face_embedding(image_array, detection)
+    face_hash = generate_face_hash(embedding) if embedding is not None else ""
+
+    details = {
+        "confidence": float(confidence),
+        "mesh_depth": float(mesh_results["nose_tip_z"]),
+        "depth_quality": mesh_results["depth_quality"],
+        "challenge": request.challenge_type,
+        "challenge_passed": passed_challenge,
+        **challenge_details
+    }
+
+    return LivenessResponse(
+        liveness_passed=liveness_passed,
+        liveness_score=liveness_score,
+        liveness_threshold=0.60,
+        face_embedding_hash=face_hash,
+        details=details
+    )
 
 
 # =============================================================================

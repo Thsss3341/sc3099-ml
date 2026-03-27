@@ -1,0 +1,26 @@
+# Ignore version control
+.git
+.gitignore
+
+# Ignore Python environment and cache
+.venv
+__pycache__
+.pytest_cache
+*.pyc
+
+# Ignore testing files
+tests/
+app/main_test.py
+
+# Ignore local development scripts not needed in the image
+app/camera.py
+app/main_nic.py
+
+# Ignore temp files and images
+captured_face_*.jpg
+.DS_Store
+
+# Ignore Docker related files
+docker-compose.yml
+Dockerfile
+.dockerignore

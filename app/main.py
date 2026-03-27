@@ -49,6 +49,18 @@ app.add_middleware(
 )
 
 
+# Redis Configuration
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+try:
+    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    # Test connection
+    redis_client.ping()
+    logger.info(f"Connected to Redis at {REDIS_URL}")
+except Exception as e:
+    logger.warning(f"Failed to connect to Redis at {REDIS_URL}: {e}")
+    redis_client = None
+
+
 # =============================================================================
 # REQUEST/RESPONSE MODELS
 # =============================================================================

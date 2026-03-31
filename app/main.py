@@ -41,6 +41,9 @@ import mediapipe as mp
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.70"))
+FACE_MISMATCH_RISK_PENALTY = float(os.getenv("FACE_MISMATCH_RISK_PENALTY", "0.40"))
+
 app = FastAPI(
     title="SAIV Face Recognition Service",
     description="Face enrollment, verification, liveness detection, and risk scoring service",
@@ -290,7 +293,7 @@ async def verify_face(request: FaceVerifyRequest):
         return FaceVerifyResponse(
             match_passed=False,
             match_score=0.0,
-            match_threshold=0.70,
+            match_threshold=FACE_MATCH_THRESHOLD,
             face_detected=False,
             current_template_hash=""
         )
@@ -301,7 +304,7 @@ async def verify_face(request: FaceVerifyRequest):
         return FaceVerifyResponse(
             match_passed=False,
             match_score=0.0,
-            match_threshold=0.70,
+            match_threshold=FACE_MATCH_THRESHOLD,
             face_detected=True,
             current_template_hash=""
         )
@@ -312,21 +315,29 @@ async def verify_face(request: FaceVerifyRequest):
     # 6 & 7. Compare hashes using Hamming Distance for SimHash
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        match_score = max(0.0, 1.0 - (dist / 32.0))
+        raw_score = max(0.0, 1.0 - (dist / 32.0))
     except (ValueError, TypeError):
         # Fallback if reference template is not a valid hex string (e.g. from old SHA-256 flow)
         if current_hash == request.reference_template_hash:
-            match_score = 1.0
+            raw_score = 1.0
         else:
-            match_score = 0.0
+            raw_score = 0.0
+
+    # Penalize weak frame quality in verification to reduce false accepts.
+    confidence = float(detection.score[0])
+    bbox = detection.location_data.relative_bounding_box
+    face_size_ratio = max(0.0, float(bbox.width * bbox.height))
+    face_size_factor = min(1.0, face_size_ratio / 0.20)
+    quality_factor = 0.7 * min(1.0, confidence) + 0.3 * face_size_factor
+    match_score = max(0.0, min(1.0, raw_score * quality_factor))
 
     # 8. Determine success based on threshold
-    match_passed = match_score >= 0.70
+    match_passed = match_score >= FACE_MATCH_THRESHOLD
     
     return FaceVerifyResponse(
         match_passed=match_passed,
         match_score=float(match_score),
-        match_threshold=0.70,
+        match_threshold=FACE_MATCH_THRESHOLD,
         face_detected=True,
         current_template_hash=current_hash
     )
@@ -559,7 +570,9 @@ async def assess_risk(request: RiskAssessRequest):
         face_risk = max(0.0, min(1.0, 1.0 - request.face_match_score)) * 0.25
         signal_breakdown["face_match"] = round(face_risk, 3)
         total_risk += face_risk
-        if request.face_match_score < 0.7:
+        if request.face_match_score < FACE_MATCH_THRESHOLD:
+            signal_breakdown["face_policy_penalty"] = round(FACE_MISMATCH_RISK_PENALTY, 3)
+            total_risk += FACE_MISMATCH_RISK_PENALTY
             recommendations.append("Re-enroll face or improve image quality")
     else:
         signal_breakdown["face_match"] = 0.0

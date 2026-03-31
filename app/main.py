@@ -572,7 +572,7 @@ async def assess_risk(request: RiskAssessRequest):
     elif has_signature or has_public_key:
         device_risk = 0.10
     else:
-        device_risk = 0.15
+        device_risk = 0.20
         recommendations.append("Register or re-bind this device before check-in")
     signal_breakdown["device"] = round(device_risk, 3)
     total_risk += device_risk

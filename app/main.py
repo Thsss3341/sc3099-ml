@@ -21,6 +21,7 @@ import base64
 import binascii
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import logging
@@ -539,8 +540,85 @@ async def assess_risk(request: RiskAssessRequest):
     - High geolocation accuracy (< 10m) might be spoofed
     - Very low accuracy (> 5000m) indicates issues
     """
-    # TODO: Implement risk assessment
-    raise HTTPException(status_code=501, detail="Not implemented")
+    signal_breakdown: Dict[str, float] = {}
+    recommendations: List[str] = []
+    total_risk = 0.0
+
+    # 1) Liveness (25%)
+    if request.liveness_score is not None:
+        liveness_risk = max(0.0, min(1.0, 1.0 - request.liveness_score)) * 0.25
+        signal_breakdown["liveness"] = round(liveness_risk, 3)
+        total_risk += liveness_risk
+        if request.liveness_score < 0.6:
+            recommendations.append("Improve lighting and face visibility")
+    else:
+        signal_breakdown["liveness"] = 0.0
+
+    # 2) Face match (25%)
+    if request.face_match_score is not None:
+        face_risk = max(0.0, min(1.0, 1.0 - request.face_match_score)) * 0.25
+        signal_breakdown["face_match"] = round(face_risk, 3)
+        total_risk += face_risk
+        if request.face_match_score < 0.7:
+            recommendations.append("Re-enroll face or improve image quality")
+    else:
+        signal_breakdown["face_match"] = 0.0
+
+    # 3) Device attestation (20%)
+    has_signature = bool(request.device_signature)
+    has_public_key = bool(request.device_public_key)
+    if has_signature and has_public_key:
+        device_risk = 0.05
+    elif has_signature or has_public_key:
+        device_risk = 0.10
+    else:
+        device_risk = 0.15
+        recommendations.append("Register or re-bind this device before check-in")
+    signal_breakdown["device"] = round(device_risk, 3)
+    total_risk += device_risk
+
+    # 4) Network/VPN (15%)
+    is_vpn, vpn_confidence = detect_vpn_proxy(request.ip_address, request.user_agent)
+    if is_vpn:
+        network_risk = min(0.15, 0.15 * vpn_confidence)
+        recommendations.append("Disable VPN/proxy and retry check-in")
+    else:
+        network_risk = 0.0
+    signal_breakdown["network"] = round(network_risk, 3)
+    total_risk += network_risk
+
+    # 5) Geolocation (15%)
+    geo_risk = 0.0
+    if request.geolocation:
+        acc = request.geolocation.accuracy
+        if acc > 5000:
+            geo_risk = 0.15
+            recommendations.append("Enable precise location services")
+        elif acc > 100:
+            geo_risk = 0.05
+    else:
+        geo_risk = 0.10
+    signal_breakdown["geolocation"] = round(geo_risk, 3)
+    total_risk += geo_risk
+
+    risk_score = round(min(1.0, total_risk), 2)
+    if risk_score < 0.3:
+        risk_level = "LOW"
+    elif risk_score < 0.5:
+        risk_level = "MEDIUM"
+    elif risk_score < 0.7:
+        risk_level = "HIGH"
+    else:
+        risk_level = "CRITICAL"
+
+    return RiskAssessResponse(
+        risk_score=risk_score,
+        risk_level=risk_level,
+        pass_threshold=risk_score < 0.50,
+        risk_threshold=0.50,
+        signal_breakdown=signal_breakdown,
+        recommendations=recommendations
+    )
 
 
 # =============================================================================
@@ -826,7 +904,29 @@ def detect_vpn_proxy(ip_address: str, user_agent: str) -> tuple:
 
     Return (is_vpn: bool, confidence: float)
     """
-    pass
+    confidence = 0.0
+    is_vpn = False
+
+    ip = (ip_address or "").strip()
+    ua = (user_agent or "").lower()
+
+    if ip:
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local:
+                is_vpn = True
+                confidence = max(confidence, 0.7)
+        except ValueError:
+            # If IP is malformed, treat as suspicious network signal
+            is_vpn = True
+            confidence = max(confidence, 0.6)
+
+    vpn_markers = ["vpn", "proxy", "tor", "wireguard", "openvpn", "tailscale", "cloudflare warp"]
+    if any(marker in ua for marker in vpn_markers):
+        is_vpn = True
+        confidence = max(confidence, 0.9)
+
+    return is_vpn, confidence
 
 
 # =============================================================================

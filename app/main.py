@@ -159,7 +159,7 @@ class RiskAssessResponse(BaseModel):
 @app.get("/health")
 async def health_check():
     """Basic health check endpoint."""
-    return {"status": "healthy"}
+    return {"status": "healthy", "service": "SAIV Face Recognition & Risk Service"}
 
 
 @app.get("/")
@@ -169,12 +169,12 @@ async def root():
         "service": "SAIV Face Recognition & Risk Service",
         "version": "1.0.0",
         "endpoints": [
-            "GET /health - Health check",
-            "POST /face/enroll - Enroll a face for verification",
-            "POST /face/verify - Verify a face against enrolled template",
-            "POST /face/match - Legacy face matching (use /face/verify)",
-            "POST /liveness/check - Perform liveness detection",
-            "POST /risk/assess - Multi-signal risk assessment"
+            "/health",
+            "/face/enroll",
+            "/face/verify",
+            "/face/match",
+            "/liveness/check",
+            "/risk/assess"
         ]
     }
 
@@ -312,12 +312,12 @@ async def verify_face(request: FaceVerifyRequest):
     # 5. Generate hash of current face
     current_hash = generate_face_hash(embedding)
     
-    # 6 & 7. Compare hashes using Hamming Distance for SimHash
+    # 6 & 7. Compare hashes using Hamming Distance for 256-bit SimHash
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        raw_score = max(0.0, 1.0 - (dist / 32.0))
+        match_score = max(0.0, 1.0 - (dist / 64.0))  # normalise over 256 bits (64 hex chars)
     except (ValueError, TypeError):
-        # Fallback if reference template is not a valid hex string (e.g. from old SHA-256 flow)
+        # Fallback: exact hash equality
         if current_hash == request.reference_template_hash:
             raw_score = 1.0
         else:
@@ -746,9 +746,9 @@ def extract_face_embedding(image_array, detection):
 class SimHasher:
     """
     Locality-Sensitive Hashing (LSH) for 1434-dimensional FaceMesh embeddings.
-    Converts FaceMesh landmarks into a 128-bit binary hash.
+    Converts FaceMesh landmarks into a 256-bit binary hash (64-char hex string).
     """
-    def __init__(self, num_bits=128, input_dim=1434, seed=42):
+    def __init__(self, num_bits=256, input_dim=1434, seed=42):
         self.num_bits = num_bits
         self.input_dim = input_dim
         # Fixed random seed ensures the same hyperplanes across server restarts
@@ -758,30 +758,27 @@ class SimHasher:
     def compute(self, embedding) -> str:
         """
         Compute the SimHash for a given FaceMesh embedding vector.
-        Returns a 32-character hex string.
+        Returns a 64-character hex string (256 bits).
         """
         emb_array = np.array(embedding)
         projections = self.planes @ emb_array
         bits = "".join("1" if p > 0 else "0" for p in projections)
-        return f"{int(bits, 2):032x}"
+        return f"{int(bits, 2):064x}"
 
 def hamming_distance(h1: str, h2: str) -> int:
     """
-    Compute the Hamming Distance between two SimHash hex strings.
+    Compute the Hamming Distance between two 256-bit SimHash hex strings.
     """
-    # Use 256 for zipping just in case we get a 64-char sha-256
-    # But SimHash is 32 chars (128 bits). For safety handle variable length
     try:
-        b1 = f"{int(h1, 16):0128b}"
-        b2 = f"{int(h2, 16):0128b}"
-        # If lengths don't match exactly (e.g. SHA256 vs SimHash length)
-        # Pad shorter string to avoid losing comparisons
+        b1 = f"{int(h1, 16):0256b}"
+        b2 = f"{int(h2, 16):0256b}"
+        # Pad to the same length in case of mismatched inputs
         max_len = max(len(b1), len(b2))
         b1 = b1.zfill(max_len)
         b2 = b2.zfill(max_len)
         return sum(a != b for a, b in zip(b1, b2))
     except ValueError:
-        return 128 # Max difference on error
+        return 256  # Max difference on error
 
 
 def generate_face_hash(embedding) -> str:

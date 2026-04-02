@@ -313,9 +313,10 @@ async def verify_face(request: FaceVerifyRequest):
     current_hash = generate_face_hash(embedding)
     
     # 6 & 7. Compare hashes using Hamming Distance for 256-bit SimHash
+    raw_score = 0.0
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        match_score = max(0.0, 1.0 - (dist / 64.0))  # normalise over 256 bits (64 hex chars)
+        raw_score = max(0.0, 1.0 - (dist / 64.0))  # normalise over 256 bits (64 hex chars)
     except (ValueError, TypeError):
         # Fallback: exact hash equality
         if current_hash == request.reference_template_hash:

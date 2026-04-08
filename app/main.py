@@ -462,15 +462,17 @@ async def check_liveness(request: LivenessRequest):
 
                 elif request.challenge_type == "head_up":
                     challenge_details["nose_y"] = nose_y
-                    # Looking up → nose moves to upper portion of frame (smaller y)
-                    if nose_y >= 0.43:
+                    # Looking up → nose moves to upper portion of frame (smaller y).
+                    # Previous cutoff (0.43) was too strict for many webcams/framing setups.
+                    # Relax to 0.50 to reduce false negatives while keeping directional intent.
+                    if nose_y >= 0.50:
                         passed_challenge = False
                         challenge_score = 0.5
 
                 elif request.challenge_type == "head_down":
                     challenge_details["nose_y"] = nose_y
                     # Looking down → nose moves to lower portion of frame (larger y)
-                    if nose_y <= 0.57:
+                    if nose_y <= 0.62:
                         passed_challenge = False
                         challenge_score = 0.5
 

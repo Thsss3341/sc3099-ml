@@ -297,7 +297,7 @@ async def verify_face(request: FaceVerifyRequest):
     raw_score = 0.0
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        raw_score = max(0.0, 1.0 - (dist / 16.0))  # make evaluation extremely strict (dist penalized heavily)
+        raw_score = max(0.0, 1.0 - (dist / 64.0))  # Better sweet-spot for differentiation
     except (ValueError, TypeError):
         # Fallback: exact hash equality
         if current_hash == request.reference_template_hash:
@@ -705,9 +705,9 @@ def extract_face_embedding(image_array, detection):
         landmarks = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks.landmark])
         
         # 2. Normalize Translation (Position invariant)
-        # Center ALL points relative to the tip of the nose (index 1)
-        nose_tip = landmarks[1]
-        landmarks = landmarks - nose_tip
+        # Center ALL points relative to the midpoint between the eyes (much more rigid than the nose tip)
+        eye_centroid = (landmarks[33] + landmarks[263]) / 2.0
+        landmarks = landmarks - eye_centroid
         
         # 3. Normalize Scale (Distance from camera invariant)
         # Calculate the inter-ocular distance (outer eyes: 33 and 263)

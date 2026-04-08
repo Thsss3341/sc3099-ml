@@ -28,7 +28,6 @@ import logging
 
 import cv2
 import numpy as np
-import redis
 from PIL import Image
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,19 +60,6 @@ app.add_middleware(
 # MediaPipe setup
 mp_face_detection = mp.solutions.face_detection
 mp_face_mesh = mp.solutions.face_mesh
-
-
-# Redis Configuration
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    # Test connection
-    redis_client.ping()
-    logger.info(f"Connected to Redis at {REDIS_URL}")
-except Exception as e:
-    logger.warning(f"Failed to connect to Redis at {REDIS_URL}: {e}")
-    redis_client = None
-
 
 # =============================================================================
 # REQUEST/RESPONSE MODELS

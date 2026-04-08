@@ -18,18 +18,14 @@ Recommended Libraries:
 """
 
 import base64
-import binascii
-import hashlib
 import io
-import json
+import ipaddress
 import os
 import logging
 
-import cv2
 import numpy as np
-import redis
 from PIL import Image
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
@@ -39,6 +35,9 @@ import mediapipe as mp
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.70"))
+FACE_MISMATCH_RISK_PENALTY = float(os.getenv("FACE_MISMATCH_RISK_PENALTY", "0.40"))
 
 app = FastAPI(
     title="SAIV Face Recognition Service",
@@ -57,19 +56,6 @@ app.add_middleware(
 # MediaPipe setup
 mp_face_detection = mp.solutions.face_detection
 mp_face_mesh = mp.solutions.face_mesh
-
-
-# Redis Configuration
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-try:
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True)
-    # Test connection
-    redis_client.ping()
-    logger.info(f"Connected to Redis at {REDIS_URL}")
-except Exception as e:
-    logger.warning(f"Failed to connect to Redis at {REDIS_URL}: {e}")
-    redis_client = None
-
 
 # =============================================================================
 # REQUEST/RESPONSE MODELS
@@ -108,7 +94,7 @@ class FaceVerifyResponse(BaseModel):
 class LivenessRequest(BaseModel):
     """Request model for liveness check."""
     challenge_response: str  # Base64 encoded image
-    challenge_type: str = "blink"  # blink, head_turn, passive
+    challenge_type: str = "passive"  # head_turn, passive
 
 
 class LivenessResponse(BaseModel):
@@ -155,7 +141,7 @@ class RiskAssessResponse(BaseModel):
 @app.get("/health")
 async def health_check():
     """Basic health check endpoint."""
-    return {"status": "healthy"}
+    return {"status": "healthy", "service": "SAIV Face Recognition & Risk Service"}
 
 
 @app.get("/")
@@ -165,12 +151,12 @@ async def root():
         "service": "SAIV Face Recognition & Risk Service",
         "version": "1.0.0",
         "endpoints": [
-            "GET /health - Health check",
-            "POST /face/enroll - Enroll a face for verification",
-            "POST /face/verify - Verify a face against enrolled template",
-            "POST /face/match - Legacy face matching (use /face/verify)",
-            "POST /liveness/check - Perform liveness detection",
-            "POST /risk/assess - Multi-signal risk assessment"
+            "/health",
+            "/face/enroll",
+            "/face/verify",
+            "/face/match",
+            "/liveness/check",
+            "/risk/assess"
         ]
     }
 
@@ -236,8 +222,7 @@ async def enroll_face(request: FaceEnrollRequest):
     
     bbox = detection.location_data.relative_bounding_box
     face_size_ratio = bbox.width * bbox.height
-    face_size_score = min(1.0, face_size_ratio / 0.1) # Cap at 1.0 if face takes >= 10% of image
-    
+    face_size_score = min(1.0, face_size_ratio / 0.1)
     quality_score = float(0.5 * confidence + 0.3 * face_size_score + 0.2 * resolution_score)
     
     if quality_score < 0.5:
@@ -289,7 +274,7 @@ async def verify_face(request: FaceVerifyRequest):
         return FaceVerifyResponse(
             match_passed=False,
             match_score=0.0,
-            match_threshold=0.70,
+            match_threshold=FACE_MATCH_THRESHOLD,
             face_detected=False,
             current_template_hash=""
         )
@@ -300,7 +285,7 @@ async def verify_face(request: FaceVerifyRequest):
         return FaceVerifyResponse(
             match_passed=False,
             match_score=0.0,
-            match_threshold=0.70,
+            match_threshold=FACE_MATCH_THRESHOLD,
             face_detected=True,
             current_template_hash=""
         )
@@ -308,24 +293,33 @@ async def verify_face(request: FaceVerifyRequest):
     # 5. Generate hash of current face
     current_hash = generate_face_hash(embedding)
     
-    # 6 & 7. Compare hashes using Hamming Distance for SimHash
+    # 6 & 7. Compare hashes using Hamming Distance for 256-bit SimHash
+    raw_score = 0.0
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        match_score = max(0.0, 1.0 - (dist / 32.0))
+        raw_score = max(0.0, 1.0 - (dist / 64.0))  # normalise over 256 bits (64 hex chars)
     except (ValueError, TypeError):
-        # Fallback if reference template is not a valid hex string (e.g. from old SHA-256 flow)
+        # Fallback: exact hash equality
         if current_hash == request.reference_template_hash:
-            match_score = 1.0
+            raw_score = 1.0
         else:
-            match_score = 0.0
+            raw_score = 0.0
+
+    # Penalize weak frame quality in verification to reduce false accepts.
+    confidence = float(detection.score[0])
+    bbox = detection.location_data.relative_bounding_box
+    face_size_ratio = max(0.0, float(bbox.width * bbox.height))
+    face_size_factor = min(1.0, face_size_ratio / 0.20)
+    quality_factor = 0.7 * min(1.0, confidence) + 0.3 * face_size_factor
+    match_score = max(0.0, min(1.0, raw_score * quality_factor))
 
     # 8. Determine success based on threshold
-    match_passed = match_score >= 0.70
+    match_passed = match_score >= FACE_MATCH_THRESHOLD
     
     return FaceVerifyResponse(
         match_passed=match_passed,
         match_score=float(match_score),
-        match_threshold=0.70,
+        match_threshold=FACE_MATCH_THRESHOLD,
         face_detected=True,
         current_template_hash=current_hash
     )
@@ -368,7 +362,6 @@ async def check_liveness(request: LivenessRequest):
 
     Challenge Types:
     - "passive": No user action required (depth/texture analysis)
-    - "blink": Detect eye blink (compare eye aspect ratios)
     - "head_turn": Detect head rotation (face mesh landmarks)
 
     5. Calculate liveness_score (0.0 to 1.0)
@@ -411,7 +404,7 @@ async def check_liveness(request: LivenessRequest):
     confidence = detection.score[0]
     bbox = detection.location_data.relative_bounding_box
     face_area = bbox.width * bbox.height
-    size_score = min(1.0, face_area / 0.1) # 10% of image is max score
+    size_score = min(1.0, face_area / 0.1)
 
     # Base depth score
     depth_mod = 1.0 if mesh_results["depth_quality"] == "good" else (0.5 if mesh_results["depth_quality"] == "moderate" else 0.0)
@@ -449,22 +442,17 @@ async def check_liveness(request: LivenessRequest):
 
                 elif request.challenge_type == "head_up":
                     challenge_details["nose_y"] = nose_y
-                    # Looking up → nose moves to upper portion of frame (smaller y)
-                    if nose_y >= 0.43:
+                    # Looking up → nose moves to upper portion of frame (smaller y).
+                    # Previous cutoff (0.43) was too strict for many webcams/framing setups.
+                    # Relax to 0.50 to reduce false negatives while keeping directional intent.
+                    if nose_y >= 0.50:
                         passed_challenge = False
                         challenge_score = 0.5
 
                 elif request.challenge_type == "head_down":
                     challenge_details["nose_y"] = nose_y
                     # Looking down → nose moves to lower portion of frame (larger y)
-                    if nose_y <= 0.57:
-                        passed_challenge = False
-                        challenge_score = 0.5
-
-                elif request.challenge_type == "blink":
-                    is_blinking, avg_ear = detect_blink(face_landmarks)
-                    challenge_details["ear"] = avg_ear
-                    if not is_blinking:
+                    if nose_y <= 0.62:
                         passed_challenge = False
                         challenge_score = 0.5
             else:
@@ -539,8 +527,87 @@ async def assess_risk(request: RiskAssessRequest):
     - High geolocation accuracy (< 10m) might be spoofed
     - Very low accuracy (> 5000m) indicates issues
     """
-    # TODO: Implement risk assessment
-    raise HTTPException(status_code=501, detail="Not implemented")
+    signal_breakdown: Dict[str, float] = {}
+    recommendations: List[str] = []
+    total_risk = 0.0
+
+    # 1. Liveness (25%)
+    if request.liveness_score is not None:
+        liveness_risk = max(0.0, min(1.0, 1.0 - request.liveness_score)) * 0.25
+        signal_breakdown["liveness"] = round(liveness_risk, 3)
+        total_risk += liveness_risk
+        if request.liveness_score < 0.6:
+            recommendations.append("Improve lighting and face visibility")
+    else:
+        signal_breakdown["liveness"] = 0.0
+
+    # 2. Face match (25%)
+    if request.face_match_score is not None:
+        face_risk = max(0.0, min(1.0, 1.0 - request.face_match_score)) * 0.25
+        signal_breakdown["face_match"] = round(face_risk, 3)
+        total_risk += face_risk
+        if request.face_match_score < FACE_MATCH_THRESHOLD:
+            signal_breakdown["face_policy_penalty"] = round(FACE_MISMATCH_RISK_PENALTY, 3)
+            total_risk += FACE_MISMATCH_RISK_PENALTY
+            recommendations.append("Re-enroll face or improve image quality")
+    else:
+        signal_breakdown["face_match"] = 0.0
+
+    # 3. Device attestation (20%)
+    has_signature = bool(request.device_signature)
+    has_public_key = bool(request.device_public_key)
+    if has_signature and has_public_key:
+        device_risk = 0.05
+    elif has_signature or has_public_key:
+        device_risk = 0.10
+    else:
+        device_risk = 0.20
+        recommendations.append("Register or re-bind this device before check-in")
+    signal_breakdown["device"] = round(device_risk, 3)
+    total_risk += device_risk
+
+    # 4. Network/VPN (15%)
+    is_vpn, vpn_confidence = detect_vpn_proxy(request.ip_address, request.user_agent)
+    if is_vpn:
+        network_risk = min(0.15, 0.15 * vpn_confidence)
+        recommendations.append("Disable VPN/proxy and retry check-in")
+    else:
+        network_risk = 0.0
+    signal_breakdown["network"] = round(network_risk, 3)
+    total_risk += network_risk
+
+    # 5. Geolocation (15%)
+    geo_risk = 0.0
+    if request.geolocation:
+        acc = request.geolocation.accuracy
+        if acc > 5000:
+            geo_risk = 0.15
+            recommendations.append("Enable precise location services")
+        elif acc > 100:
+            geo_risk = 0.05
+    else:
+        geo_risk = 0.10
+    signal_breakdown["geolocation"] = round(geo_risk, 3)
+    total_risk += geo_risk
+
+    risk_score = round(min(1.0, total_risk), 2)
+    if risk_score < 0.3:
+        risk_level = "LOW"
+    elif risk_score < 0.5:
+        risk_level = "MEDIUM"
+    elif risk_score < 0.7:
+        risk_level = "HIGH"
+    else:
+        risk_level = "CRITICAL"
+
+    return RiskAssessResponse(
+        risk_score=risk_score,
+        risk_level=risk_level,
+        pass_threshold=risk_score < 0.50,
+        risk_threshold=0.50,
+        signal_breakdown=signal_breakdown,
+        recommendations=recommendations
+    )
 
 
 # =============================================================================
@@ -655,9 +722,9 @@ def extract_face_embedding(image_array, detection):
 class SimHasher:
     """
     Locality-Sensitive Hashing (LSH) for 1434-dimensional FaceMesh embeddings.
-    Converts FaceMesh landmarks into a 128-bit binary hash.
+    Converts FaceMesh landmarks into a 256-bit binary hash (64-char hex string).
     """
-    def __init__(self, num_bits=128, input_dim=1434, seed=42):
+    def __init__(self, num_bits=256, input_dim=1434, seed=42):
         self.num_bits = num_bits
         self.input_dim = input_dim
         # Fixed random seed ensures the same hyperplanes across server restarts
@@ -667,30 +734,27 @@ class SimHasher:
     def compute(self, embedding) -> str:
         """
         Compute the SimHash for a given FaceMesh embedding vector.
-        Returns a 32-character hex string.
+        Returns a 64-character hex string (256 bits).
         """
         emb_array = np.array(embedding)
         projections = self.planes @ emb_array
         bits = "".join("1" if p > 0 else "0" for p in projections)
-        return f"{int(bits, 2):032x}"
+        return f"{int(bits, 2):064x}"
 
 def hamming_distance(h1: str, h2: str) -> int:
     """
-    Compute the Hamming Distance between two SimHash hex strings.
+    Compute the Hamming Distance between two 256-bit SimHash hex strings.
     """
-    # Use 256 for zipping just in case we get a 64-char sha-256
-    # But SimHash is 32 chars (128 bits). For safety handle variable length
     try:
-        b1 = f"{int(h1, 16):0128b}"
-        b2 = f"{int(h2, 16):0128b}"
-        # If lengths don't match exactly (e.g. SHA256 vs SimHash length)
-        # Pad shorter string to avoid losing comparisons
+        b1 = f"{int(h1, 16):0256b}"
+        b2 = f"{int(h2, 16):0256b}"
+        # Pad to the same length in case of mismatched inputs
         max_len = max(len(b1), len(b2))
         b1 = b1.zfill(max_len)
         b2 = b2.zfill(max_len)
         return sum(a != b for a, b in zip(b1, b2))
     except ValueError:
-        return 128 # Max difference on error
+        return 256
 
 
 def generate_face_hash(embedding) -> str:
@@ -743,8 +807,6 @@ def analyze_face_mesh(image_array):
         nose_tip_z = face_landmarks.landmark[1].z
         abs_z = abs(nose_tip_z)
         
-        # |nose_tip_z| > 0.03 (significant depth)
-        # |nose_tip_z| < 0.01 (minimal depth)
         if abs_z > 0.03:
             depth_quality = "good"
         elif abs_z < 0.01:
@@ -760,60 +822,6 @@ def analyze_face_mesh(image_array):
         }
 
 
-def detect_blink(face_mesh_landmarks):
-    """
-    Detect eye blink from face mesh landmarks (BONUS).
-
-    TODO: Implement using:
-    - Eye landmark indices (see MediaPipe docs)
-    - Calculate Eye Aspect Ratio (EAR)
-    - EAR < threshold indicates closed eye
-    """
-    if not face_mesh_landmarks or not hasattr(face_mesh_landmarks, 'landmark'):
-        return False, 0.0
-
-    landmarks = face_mesh_landmarks.landmark
-    
-    # Left eye standard MediaPipe indices: [p1, p2, p3, p4, p5, p6]
-    LEFT_EYE = [33, 160, 158, 133, 153, 144]
-    
-    # Right eye standard MediaPipe indices: [p1, p2, p3, p4, p5, p6]
-    RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-    
-    def calculate_ear(eye_indices):
-        p1 = np.array([landmarks[eye_indices[0]].x, landmarks[eye_indices[0]].y])
-        p2 = np.array([landmarks[eye_indices[1]].x, landmarks[eye_indices[1]].y])
-        p3 = np.array([landmarks[eye_indices[2]].x, landmarks[eye_indices[2]].y])
-        p4 = np.array([landmarks[eye_indices[3]].x, landmarks[eye_indices[3]].y])
-        p5 = np.array([landmarks[eye_indices[4]].x, landmarks[eye_indices[4]].y])
-        p6 = np.array([landmarks[eye_indices[5]].x, landmarks[eye_indices[5]].y])
-        
-        vert1 = np.linalg.norm(p2 - p6)
-        vert2 = np.linalg.norm(p3 - p5)
-        horiz = np.linalg.norm(p1 - p4)
-        
-        if horiz == 0:
-            return 0.0
-            
-        return (vert1 + vert2) / (2.0 * horiz)
-        
-    left_ear = calculate_ear(LEFT_EYE)
-    right_ear = calculate_ear(RIGHT_EYE)
-    
-    # Average EAR
-    avg_ear = (left_ear + right_ear) / 2.0
-    
-    # Open eyes: EAR ~0.25-0.40. Closed/squinting: 0.15-0.25.
-    # Using 0.30 to catch deliberate squints without requiring full eye closure.
-    BLINK_THRESHOLD = 0.30
-    
-    is_blinking = avg_ear < BLINK_THRESHOLD
-    print(f"[Blink] avg_ear={avg_ear:.4f}, threshold={BLINK_THRESHOLD}, detected={is_blinking}")
-    logger.info(f"Blink check: avg_ear={avg_ear:.3f}, threshold={BLINK_THRESHOLD}, is_blinking={is_blinking}")
-    
-    return is_blinking, avg_ear
-
-
 def detect_vpn_proxy(ip_address: str, user_agent: str) -> tuple:
     """
     Detect VPN/proxy usage.
@@ -826,7 +834,29 @@ def detect_vpn_proxy(ip_address: str, user_agent: str) -> tuple:
 
     Return (is_vpn: bool, confidence: float)
     """
-    pass
+    confidence = 0.0
+    is_vpn = False
+
+    ip = (ip_address or "").strip()
+    ua = (user_agent or "").lower()
+
+    if ip:
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved or ip_obj.is_link_local:
+                is_vpn = True
+                confidence = max(confidence, 0.7)
+        except ValueError:
+            # If IP is malformed, treat as suspicious network signal
+            is_vpn = True
+            confidence = max(confidence, 0.6)
+
+    vpn_markers = ["vpn", "proxy", "tor", "wireguard", "openvpn", "tailscale", "cloudflare warp"]
+    if any(marker in ua for marker in vpn_markers):
+        is_vpn = True
+        confidence = max(confidence, 0.9)
+
+    return is_vpn, confidence
 
 
 # =============================================================================

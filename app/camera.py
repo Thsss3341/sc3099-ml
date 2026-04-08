@@ -10,8 +10,6 @@ import numpy as np
 # Add current directory to path so we can import main
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Set Redis URL to match user's Docker config (port 6380)
-os.environ["REDIS_URL"] = "redis://localhost:6380/0"
 
 try:
     import main

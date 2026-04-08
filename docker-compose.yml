@@ -7,26 +7,10 @@ services:
     ports:
       - "8001:8001"
     environment:
-      REDIS_URL: redis://redis:6379/0
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-    depends_on:
-      redis:
-        condition: service_healthy
     networks:
       - saiv-network
 
-  redis:
-    image: redis:7-alpine
-    container_name: saiv-redis
-    ports:
-      - "6380:6379"
-    healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    networks:
-      - saiv-network
 
   otel-collector:
     image: otel/opentelemetry-collector:latest

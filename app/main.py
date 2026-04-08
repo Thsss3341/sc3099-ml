@@ -18,18 +18,14 @@ Recommended Libraries:
 """
 
 import base64
-import binascii
-import hashlib
 import io
 import ipaddress
-import json
 import os
 import logging
 
-import cv2
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
@@ -98,7 +94,7 @@ class FaceVerifyResponse(BaseModel):
 class LivenessRequest(BaseModel):
     """Request model for liveness check."""
     challenge_response: str  # Base64 encoded image
-    challenge_type: str = "blink"  # blink, head_turn, passive
+    challenge_type: str = "passive"  # head_turn, passive
 
 
 class LivenessResponse(BaseModel):
@@ -226,8 +222,7 @@ async def enroll_face(request: FaceEnrollRequest):
     
     bbox = detection.location_data.relative_bounding_box
     face_size_ratio = bbox.width * bbox.height
-    face_size_score = min(1.0, face_size_ratio / 0.1) # Cap at 1.0 if face takes >= 10% of image
-    
+    face_size_score = min(1.0, face_size_ratio / 0.1)
     quality_score = float(0.5 * confidence + 0.3 * face_size_score + 0.2 * resolution_score)
     
     if quality_score < 0.5:
@@ -367,7 +362,6 @@ async def check_liveness(request: LivenessRequest):
 
     Challenge Types:
     - "passive": No user action required (depth/texture analysis)
-    - "blink": Detect eye blink (compare eye aspect ratios)
     - "head_turn": Detect head rotation (face mesh landmarks)
 
     5. Calculate liveness_score (0.0 to 1.0)
@@ -410,7 +404,7 @@ async def check_liveness(request: LivenessRequest):
     confidence = detection.score[0]
     bbox = detection.location_data.relative_bounding_box
     face_area = bbox.width * bbox.height
-    size_score = min(1.0, face_area / 0.1) # 10% of image is max score
+    size_score = min(1.0, face_area / 0.1)
 
     # Base depth score
     depth_mod = 1.0 if mesh_results["depth_quality"] == "good" else (0.5 if mesh_results["depth_quality"] == "moderate" else 0.0)
@@ -459,13 +453,6 @@ async def check_liveness(request: LivenessRequest):
                     challenge_details["nose_y"] = nose_y
                     # Looking down → nose moves to lower portion of frame (larger y)
                     if nose_y <= 0.62:
-                        passed_challenge = False
-                        challenge_score = 0.5
-
-                elif request.challenge_type == "blink":
-                    is_blinking, avg_ear = detect_blink(face_landmarks)
-                    challenge_details["ear"] = avg_ear
-                    if not is_blinking:
                         passed_challenge = False
                         challenge_score = 0.5
             else:
@@ -544,7 +531,7 @@ async def assess_risk(request: RiskAssessRequest):
     recommendations: List[str] = []
     total_risk = 0.0
 
-    # 1) Liveness (25%)
+    # 1. Liveness (25%)
     if request.liveness_score is not None:
         liveness_risk = max(0.0, min(1.0, 1.0 - request.liveness_score)) * 0.25
         signal_breakdown["liveness"] = round(liveness_risk, 3)
@@ -554,7 +541,7 @@ async def assess_risk(request: RiskAssessRequest):
     else:
         signal_breakdown["liveness"] = 0.0
 
-    # 2) Face match (25%)
+    # 2. Face match (25%)
     if request.face_match_score is not None:
         face_risk = max(0.0, min(1.0, 1.0 - request.face_match_score)) * 0.25
         signal_breakdown["face_match"] = round(face_risk, 3)
@@ -566,7 +553,7 @@ async def assess_risk(request: RiskAssessRequest):
     else:
         signal_breakdown["face_match"] = 0.0
 
-    # 3) Device attestation (20%)
+    # 3. Device attestation (20%)
     has_signature = bool(request.device_signature)
     has_public_key = bool(request.device_public_key)
     if has_signature and has_public_key:
@@ -579,7 +566,7 @@ async def assess_risk(request: RiskAssessRequest):
     signal_breakdown["device"] = round(device_risk, 3)
     total_risk += device_risk
 
-    # 4) Network/VPN (15%)
+    # 4. Network/VPN (15%)
     is_vpn, vpn_confidence = detect_vpn_proxy(request.ip_address, request.user_agent)
     if is_vpn:
         network_risk = min(0.15, 0.15 * vpn_confidence)
@@ -589,7 +576,7 @@ async def assess_risk(request: RiskAssessRequest):
     signal_breakdown["network"] = round(network_risk, 3)
     total_risk += network_risk
 
-    # 5) Geolocation (15%)
+    # 5. Geolocation (15%)
     geo_risk = 0.0
     if request.geolocation:
         acc = request.geolocation.accuracy
@@ -767,7 +754,7 @@ def hamming_distance(h1: str, h2: str) -> int:
         b2 = b2.zfill(max_len)
         return sum(a != b for a, b in zip(b1, b2))
     except ValueError:
-        return 256  # Max difference on error
+        return 256
 
 
 def generate_face_hash(embedding) -> str:
@@ -820,8 +807,6 @@ def analyze_face_mesh(image_array):
         nose_tip_z = face_landmarks.landmark[1].z
         abs_z = abs(nose_tip_z)
         
-        # |nose_tip_z| > 0.03 (significant depth)
-        # |nose_tip_z| < 0.01 (minimal depth)
         if abs_z > 0.03:
             depth_quality = "good"
         elif abs_z < 0.01:
@@ -835,60 +820,6 @@ def analyze_face_mesh(image_array):
             "nose_tip_z": float(nose_tip_z),
             "depth_quality": depth_quality
         }
-
-
-def detect_blink(face_mesh_landmarks):
-    """
-    Detect eye blink from face mesh landmarks (BONUS).
-
-    TODO: Implement using:
-    - Eye landmark indices (see MediaPipe docs)
-    - Calculate Eye Aspect Ratio (EAR)
-    - EAR < threshold indicates closed eye
-    """
-    if not face_mesh_landmarks or not hasattr(face_mesh_landmarks, 'landmark'):
-        return False, 0.0
-
-    landmarks = face_mesh_landmarks.landmark
-    
-    # Left eye standard MediaPipe indices: [p1, p2, p3, p4, p5, p6]
-    LEFT_EYE = [33, 160, 158, 133, 153, 144]
-    
-    # Right eye standard MediaPipe indices: [p1, p2, p3, p4, p5, p6]
-    RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-    
-    def calculate_ear(eye_indices):
-        p1 = np.array([landmarks[eye_indices[0]].x, landmarks[eye_indices[0]].y])
-        p2 = np.array([landmarks[eye_indices[1]].x, landmarks[eye_indices[1]].y])
-        p3 = np.array([landmarks[eye_indices[2]].x, landmarks[eye_indices[2]].y])
-        p4 = np.array([landmarks[eye_indices[3]].x, landmarks[eye_indices[3]].y])
-        p5 = np.array([landmarks[eye_indices[4]].x, landmarks[eye_indices[4]].y])
-        p6 = np.array([landmarks[eye_indices[5]].x, landmarks[eye_indices[5]].y])
-        
-        vert1 = np.linalg.norm(p2 - p6)
-        vert2 = np.linalg.norm(p3 - p5)
-        horiz = np.linalg.norm(p1 - p4)
-        
-        if horiz == 0:
-            return 0.0
-            
-        return (vert1 + vert2) / (2.0 * horiz)
-        
-    left_ear = calculate_ear(LEFT_EYE)
-    right_ear = calculate_ear(RIGHT_EYE)
-    
-    # Average EAR
-    avg_ear = (left_ear + right_ear) / 2.0
-    
-    # Open eyes: EAR ~0.25-0.40. Closed/squinting: 0.15-0.25.
-    # Using 0.30 to catch deliberate squints without requiring full eye closure.
-    BLINK_THRESHOLD = 0.30
-    
-    is_blinking = avg_ear < BLINK_THRESHOLD
-    print(f"[Blink] avg_ear={avg_ear:.4f}, threshold={BLINK_THRESHOLD}, detected={is_blinking}")
-    logger.info(f"Blink check: avg_ear={avg_ear:.3f}, threshold={BLINK_THRESHOLD}, is_blinking={is_blinking}")
-    
-    return is_blinking, avg_ear
 
 
 def detect_vpn_proxy(ip_address: str, user_agent: str) -> tuple:

@@ -297,7 +297,7 @@ async def verify_face(request: FaceVerifyRequest):
     raw_score = 0.0
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        raw_score = max(0.0, 1.0 - (dist / 64.0))  # Better sweet-spot for differentiation
+        raw_score = max(0.0, 1.0 - (dist / 256.0))  # Better sweet-spot for differentiation
     except (ValueError, TypeError):
         # Fallback: exact hash equality
         if current_hash == request.reference_template_hash:
@@ -689,33 +689,54 @@ def extract_face_embedding(image_array, detection):
 
     Return numpy array that can be hashed.
     """
+    if detection is None:
+        return None
+
+    bbox = detection.location_data.relative_bounding_box
+    h, w = image_array.shape[:2]
+
+    x_min = int(bbox.xmin * w)
+    y_min = int(bbox.ymin * h)
+    box_w = int(bbox.width * w)
+    box_h = int(bbox.height * h)
+
+    # Expand crop a bit for stable landmark context (jawline/forehead).
+    margin_x = int(box_w * 0.15)
+    margin_y = int(box_h * 0.20)
+    x_min = max(0, x_min - margin_x)
+    y_min = max(0, y_min - margin_y)
+    x_max = min(w, x_min + box_w + 2 * margin_x)
+    y_max = min(h, y_min + box_h + 2 * margin_y)
+
+    face_crop = image_array[y_min:y_max, x_min:x_max]
+    if face_crop.size == 0 or face_crop.shape[0] < 32 or face_crop.shape[1] < 32:
+        return None
+
     with mp_face_mesh.FaceMesh(
         static_image_mode=True,
         max_num_faces=1,
         refine_landmarks=True,
         min_detection_confidence=0.5
     ) as face_mesh:
-        results = face_mesh.process(image_array)
+        results = face_mesh.process(face_crop)
         if not results.multi_face_landmarks:
             return None
-            
+
         face_landmarks = results.multi_face_landmarks[0]
-        
+
         # 1. Convert to NumPy array
         landmarks = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks.landmark])
-        
-        # 2. Normalize Translation (Position invariant)
-        # Center ALL points relative to the midpoint between the eyes (much more rigid than the nose tip)
+
+        # 2. Normalize translation (position invariant)
         eye_centroid = (landmarks[33] + landmarks[263]) / 2.0
         landmarks = landmarks - eye_centroid
-        
-        # 3. Normalize Scale (Distance from camera invariant)
-        # Calculate the inter-ocular distance (outer eyes: 33 and 263)
+
+        # 3. Normalize scale (distance-to-camera invariant)
         eye_distance = np.linalg.norm(landmarks[33] - landmarks[263])
         if eye_distance > 0:
             landmarks = landmarks / eye_distance
-            
-        # Return 1434 normalized floating point values
+
+        # Return 1434 normalized floating-point values
         return landmarks.flatten().astype(np.float32)
 
 

@@ -297,7 +297,7 @@ async def verify_face(request: FaceVerifyRequest):
     raw_score = 0.0
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        raw_score = max(0.0, 1.0 - (dist / 24.0))  # make evaluation extremely strict (dist penalized heavily)
+        raw_score = max(0.0, 1.0 - (dist / 16.0))  # make evaluation extremely strict (dist penalized heavily)
     except (ValueError, TypeError):
         # Fallback: exact hash equality
         if current_hash == request.reference_template_hash:

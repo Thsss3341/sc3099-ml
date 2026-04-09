@@ -8,6 +8,13 @@ services:
       - "8001:8001"
     environment:
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      MOBILEFACENET_MODEL_PATH: /app/app/models/w600k_mbf.onnx
+      FACE_MATCH_THRESHOLD: "0.73"
+      FACE_HASH_SIMILARITY_MIN: "0.67"
+      FACE_SIM_LOGISTIC_CENTER: "0.70"
+      FACE_SIM_LOGISTIC_STEEPNESS: "28.0"
+    volumes:
+      - ./app/models:/app/app/models:ro
     networks:
       - saiv-network
 

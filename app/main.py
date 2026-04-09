@@ -23,7 +23,9 @@ import ipaddress
 import os
 import logging
 
+import cv2
 import numpy as np
+import onnxruntime as ort
 from PIL import Image
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +40,17 @@ logger = logging.getLogger(__name__)
 
 FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.70"))
 FACE_MISMATCH_RISK_PENALTY = float(os.getenv("FACE_MISMATCH_RISK_PENALTY", "0.40"))
+FACE_HASH_SIMILARITY_MIN = float(os.getenv("FACE_HASH_SIMILARITY_MIN", "0.64"))
+FACE_SIM_LOGISTIC_CENTER = float(os.getenv("FACE_SIM_LOGISTIC_CENTER", "0.68"))
+FACE_SIM_LOGISTIC_STEEPNESS = float(os.getenv("FACE_SIM_LOGISTIC_STEEPNESS", "26.0"))
+MOBILEFACENET_MODEL_PATH = os.getenv("MOBILEFACENET_MODEL_PATH", "app/models/w600k_mbf.onnx")
+
+_mobilefacenet_session = None
+_mobilefacenet_input_name = None
+_mobilefacenet_output_name = None
+_mobilefacenet_input_height = 112
+_mobilefacenet_input_width = 112
+_mobilefacenet_input_layout = "NCHW"
 
 app = FastAPI(
     title="SAIV Face Recognition Service",
@@ -294,24 +307,37 @@ async def verify_face(request: FaceVerifyRequest):
     current_hash = generate_face_hash(embedding)
     
     # 6 & 7. Compare hashes using Hamming Distance for 256-bit SimHash
+    # Convert Hamming similarity to a calibrated score curve for live webcam noise.
     raw_score = 0.0
+    similarity = 0.0
     try:
         dist = hamming_distance(current_hash, request.reference_template_hash)
-        raw_score = max(0.0, 1.0 - (dist / 256.0))  # Better sweet-spot for differentiation
+        similarity = max(0.0, min(1.0, 1.0 - (dist / 256.0)))
+        # Stricter logistic calibration to reduce false accepts.
+        raw_score = float(
+            1.0 / (1.0 + np.exp(-FACE_SIM_LOGISTIC_STEEPNESS * (similarity - FACE_SIM_LOGISTIC_CENTER)))
+        )
     except (ValueError, TypeError):
         # Fallback: exact hash equality
         if current_hash == request.reference_template_hash:
             raw_score = 1.0
+            similarity = 1.0
         else:
             raw_score = 0.0
+            similarity = 0.0
 
-    # Penalize weak frame quality in verification to reduce false accepts.
+    # Apply a mild quality adjustment (instead of hard multiplicative penalty).
     confidence = float(detection.score[0])
     bbox = detection.location_data.relative_bounding_box
     face_size_ratio = max(0.0, float(bbox.width * bbox.height))
     face_size_factor = min(1.0, face_size_ratio / 0.20)
     quality_factor = 0.7 * min(1.0, confidence) + 0.3 * face_size_factor
-    match_score = max(0.0, min(1.0, raw_score * quality_factor))
+    quality_multiplier = 0.9 + 0.1 * quality_factor
+    match_score = max(0.0, min(1.0, raw_score * quality_multiplier))
+
+    # Hard guardrail: disallow pass when hash similarity is below floor.
+    if similarity < FACE_HASH_SIMILARITY_MIN:
+        match_score = min(match_score, FACE_MATCH_THRESHOLD - 0.01)
 
     # 8. Determine success based on threshold
     match_passed = match_score >= FACE_MATCH_THRESHOLD
@@ -712,6 +738,11 @@ def extract_face_embedding(image_array, detection):
     if face_crop.size == 0 or face_crop.shape[0] < 32 or face_crop.shape[1] < 32:
         return None
 
+    mobilefacenet_embedding = extract_mobilefacenet_embedding(face_crop)
+    if mobilefacenet_embedding is not None:
+        return mobilefacenet_embedding
+
+    # Fallback path: keep FaceMesh landmark embedding available when model is missing.
     with mp_face_mesh.FaceMesh(
         static_image_mode=True,
         max_num_faces=1,
@@ -723,34 +754,125 @@ def extract_face_embedding(image_array, detection):
             return None
 
         face_landmarks = results.multi_face_landmarks[0]
-
-        # 1. Convert to NumPy array
         landmarks = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks.landmark])
-
-        # 2. Normalize translation (position invariant)
         eye_centroid = (landmarks[33] + landmarks[263]) / 2.0
         landmarks = landmarks - eye_centroid
-
-        # 3. Normalize scale (distance-to-camera invariant)
         eye_distance = np.linalg.norm(landmarks[33] - landmarks[263])
         if eye_distance > 0:
             landmarks = landmarks / eye_distance
 
-        # Return 1434 normalized floating-point values
         return landmarks.flatten().astype(np.float32)
+
+
+def get_mobilefacenet_session():
+    """Lazily initialize ONNX Runtime session for MobileFaceNet."""
+    global _mobilefacenet_session, _mobilefacenet_input_name, _mobilefacenet_output_name
+    global _mobilefacenet_input_height, _mobilefacenet_input_width, _mobilefacenet_input_layout
+
+    if _mobilefacenet_session is not None:
+        return _mobilefacenet_session, _mobilefacenet_input_name, _mobilefacenet_output_name
+
+    if not os.path.exists(MOBILEFACENET_MODEL_PATH):
+        logger.warning(
+            "MobileFaceNet model not found at %s. Falling back to FaceMesh embedding.",
+            MOBILEFACENET_MODEL_PATH,
+        )
+        return None, None, None
+
+    try:
+        session = ort.InferenceSession(
+            MOBILEFACENET_MODEL_PATH,
+            providers=["CPUExecutionProvider"],
+        )
+        input_meta = session.get_inputs()[0]
+        output_meta = session.get_outputs()[0]
+        input_name = input_meta.name
+        output_name = output_meta.name
+
+        input_shape = input_meta.shape
+        if len(input_shape) == 4:
+            # Typical models are either NCHW [N,3,H,W] or NHWC [N,H,W,3].
+            if input_shape[1] == 3:
+                _mobilefacenet_input_layout = "NCHW"
+                _mobilefacenet_input_height = int(input_shape[2]) if isinstance(input_shape[2], int) else 112
+                _mobilefacenet_input_width = int(input_shape[3]) if isinstance(input_shape[3], int) else 112
+            elif input_shape[3] == 3:
+                _mobilefacenet_input_layout = "NHWC"
+                _mobilefacenet_input_height = int(input_shape[1]) if isinstance(input_shape[1], int) else 112
+                _mobilefacenet_input_width = int(input_shape[2]) if isinstance(input_shape[2], int) else 112
+
+        _mobilefacenet_session = session
+        _mobilefacenet_input_name = input_name
+        _mobilefacenet_output_name = output_name
+        logger.info(
+            "Loaded MobileFaceNet model from %s (input=%s, layout=%s, resize=%dx%d)",
+            MOBILEFACENET_MODEL_PATH,
+            input_shape,
+            _mobilefacenet_input_layout,
+            _mobilefacenet_input_width,
+            _mobilefacenet_input_height,
+        )
+
+        output_shape = output_meta.shape
+        if isinstance(output_shape, list):
+            known_embed_dims = {64, 96, 128, 192, 256, 384, 512}
+            flat_dim = None
+            numeric_dims = [d for d in output_shape if isinstance(d, int)]
+            if numeric_dims:
+                flat_dim = int(np.prod(numeric_dims))
+            if flat_dim is not None and flat_dim not in known_embed_dims:
+                logger.warning(
+                    "Model output shape %s (flat=%d) is unusual for face embeddings; "
+                    "you may be using a classification model.",
+                    output_shape,
+                    flat_dim,
+                )
+        return session, input_name, output_name
+    except Exception as exc:
+        logger.error("Failed to load MobileFaceNet model: %s", exc)
+        return None, None, None
+
+
+def preprocess_mobilefacenet(face_rgb: np.ndarray) -> np.ndarray:
+    """Prepare RGB face crop for MobileFaceNet ONNX inference."""
+    resized = cv2.resize(face_rgb, (_mobilefacenet_input_width, _mobilefacenet_input_height))
+    normalized = (resized.astype(np.float32) - 127.5) / 128.0
+    if _mobilefacenet_input_layout == "NHWC":
+        return np.expand_dims(normalized, axis=0)
+    chw = np.transpose(normalized, (2, 0, 1))
+    return np.expand_dims(chw, axis=0)
+
+
+def extract_mobilefacenet_embedding(face_crop: np.ndarray):
+    """Run MobileFaceNet ONNX model and return L2-normalized embedding."""
+    session, input_name, output_name = get_mobilefacenet_session()
+    if session is None:
+        return None
+
+    try:
+        model_input = preprocess_mobilefacenet(face_crop)
+        outputs = session.run([output_name], {input_name: model_input})
+        embedding = np.asarray(outputs[0]).reshape(-1).astype(np.float32)
+        norm = float(np.linalg.norm(embedding))
+        if norm <= 1e-8:
+            return None
+        return embedding / norm
+    except Exception as exc:
+        logger.error("MobileFaceNet inference failed: %s", exc)
+        return None
 
 
 class SimHasher:
     """
-    Locality-Sensitive Hashing (LSH) for 1434-dimensional FaceMesh embeddings.
-    Converts FaceMesh landmarks into a 256-bit binary hash (64-char hex string).
+    Locality-Sensitive Hashing (LSH) for face embeddings.
+    Converts embeddings into a 256-bit binary hash (64-char hex string).
     """
-    def __init__(self, num_bits=256, input_dim=1434, seed=42):
+    def __init__(self, num_bits=256, input_dim=128, seed=42):
         self.num_bits = num_bits
         self.input_dim = input_dim
         # Fixed random seed ensures the same hyperplanes across server restarts
-        np.random.seed(seed)
-        self.planes = np.random.randn(self.num_bits, self.input_dim)
+        rng = np.random.default_rng(seed)
+        self.planes = rng.standard_normal((self.num_bits, self.input_dim))
         
     def compute(self, embedding) -> str:
         """
@@ -782,8 +904,9 @@ def generate_face_hash(embedding) -> str:
     """
     Generate SimHash of face embedding for privacy-preserving verification.
     """
-    hasher = SimHasher()
-    return hasher.compute(embedding)
+    emb_array = np.asarray(embedding).reshape(-1)
+    hasher = SimHasher(input_dim=int(emb_array.shape[0]))
+    return hasher.compute(emb_array)
 
 
 def analyze_face_mesh(image_array):

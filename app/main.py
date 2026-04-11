@@ -27,11 +27,12 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from PIL import Image
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
 import mediapipe as mp
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 
 # Configure Logging
@@ -58,6 +59,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
+HTTP_REQUEST_TOTAL = Counter(
+    "saiv_ml_http_requests_total",
+    "Total HTTP requests handled by the ML service",
+    ["method", "path", "status"],
+)
+
+HTTP_REQUEST_DURATION_SECONDS = Histogram(
+    "saiv_ml_http_request_duration_seconds",
+    "HTTP request latency in seconds for the ML service",
+    ["method", "path"],
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,6 +79,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _normalized_path(request: Request) -> str:
+    route = request.scope.get("route")
+    path = getattr(route, "path", None)
+    return path or request.url.path
+
+
+@app.middleware("http")
+async def capture_request_metrics(request: Request, call_next):
+    path = _normalized_path(request)
+    timer = HTTP_REQUEST_DURATION_SECONDS.labels(method=request.method, path=path).time()
+    with timer:
+        response = await call_next(request)
+
+    HTTP_REQUEST_TOTAL.labels(
+        method=request.method,
+        path=path,
+        status=str(response.status_code),
+    ).inc()
+    return response
 
 # MediaPipe setup
 mp_face_detection = mp.solutions.face_detection
@@ -155,6 +190,12 @@ class RiskAssessResponse(BaseModel):
 async def health_check():
     """Basic health check endpoint."""
     return {"status": "healthy", "service": "SAIV Face Recognition & Risk Service"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint for scraping ML service telemetry."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/")
